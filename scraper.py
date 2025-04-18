@@ -10,10 +10,16 @@ import argparse
 import time
 import requests
 
+# --- Load secrets ---
+if os.environ.get("GITHUB_ACTIONS") != "true":
+    from dotenv import load_dotenv
+    load_dotenv()
+
 EMAIL = os.environ["THS_EMAIL"]
 PASSWORD = os.environ["THS_PASSWORD"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+HEADLESS = os.environ.get("GITHUB_ACTIONS") == "true"
 
 PET_TYPES = ["dog", "cat", "horse", "bird", "fish", "rabbit", "reptile", "poultry", "livestock", "small_pets"]
 
@@ -27,6 +33,11 @@ def split_location(location):
     if len(parts) == 2:
         return parts[0], parts[1]
     return location, ""
+
+def escape_markdown(text):
+    if not isinstance(text, str):
+        return text
+    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 async def wait_like_human(min_sec=0.2, max_sec=0.5):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
@@ -52,14 +63,14 @@ def format_telegram_message(new_rows):
     lines = ["🔔 *New TrustedHousesitters Listings:*", ""]
     for i, row in enumerate(new_rows, 1):
         pets = ", ".join([f"{row[p]} {p}" for p in PET_TYPES if row.get(p, 0)])
-        lines.append(f"{i}. *{row['title']}*")
-        lines.append(f"   📍 {row['town']}, {row['country']}")
-        lines.append(f"   📅 {row['date_from']} → {row['date_to']}")
+        lines.append(f"{i}. *{escape_markdown(row['title'])}*")
+        lines.append(f"   📍 {escape_markdown(row['town'])}, {escape_markdown(row['country'])}")
+        lines.append(f"   📅 {escape_markdown(row['date_from'])} → {escape_markdown(row['date_to'])}")
         if pets:
-            lines.append(f"   🐾 Pets: {pets}")
+            lines.append(f"   🐾 Pets: {escape_markdown(pets)}")
         if row['reviewing']:
             lines.append(f"   📝 Reviewing applications")
-        lines.append(f"   🔗 [View listing]({row['url']})")
+        lines.append(f"   🔗 [View listing]({escape_markdown(row['url'])})")
         lines.append("")
     return "\n".join(lines)
 
@@ -82,7 +93,7 @@ def send_telegram_message(text, chunk_size=4000):
 async def main(test_mode=False):
     global_start = time.time()
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(headless=HEADLESS)
         context = await browser.new_context()
         page = await context.new_page()
 
