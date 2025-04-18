@@ -34,7 +34,7 @@ def split_location(location):
 def escape_markdown(text):
     if not isinstance(text, str):
         return text
-    return re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
 async def wait_like_human(min_sec=0.2, max_sec=0.5):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
@@ -57,34 +57,46 @@ async def extract_pets(card):
     return counts
 
 def format_telegram_message(rows):
-    lines = ["🔔 *New TrustedHousesitters Listings:*", ""]
-    for i, row in enumerate(rows, 1):
-        pets = ", ".join([f"{row[p]} {p}" for p in PET_TYPES if row.get(p, 0)])
-        lines.append(f"{i}. *{escape_markdown(row['title'])}*")
-        lines.append(f"   📍 {escape_markdown(row['town'])}, {escape_markdown(row['country'])}")
-        lines.append(f"   📅 {escape_markdown(row['date_from'])} → {escape_markdown(row['date_to'])}")
-        if pets:
-            lines.append(f"   🐾 Pets: {escape_markdown(pets)}")
-        if row['reviewing']:
-            lines.append(f"   📝 Reviewing applications")
-        lines.append(f"   🔗 [View listing]({escape_markdown(row['url'])})")
-        lines.append("")
-    return "\n".join(lines)
+    chunks = []
+    for i in range(0, len(rows), 4):
+        group = rows[i:i + 4]
+        lines = ["🔔 *New TrustedHousesitters Listings:*", ""]
+        for j, row in enumerate(group, i + 1):
+            pets = ", ".join([f"{row[p]} {p}" for p in PET_TYPES if row.get(p, 0)])
+            lines.append(f"{j}. *{escape_markdown(row['title'])}*")
+            lines.append(f"   📍 {escape_markdown(row['town'])}, {escape_markdown(row['country'])}")
+            lines.append(f"   📅 {escape_markdown(row['date_from'])} → {escape_markdown(row['date_to'])}")
+            if pets:
+                lines.append(f"   🐾 Pets: {escape_markdown(pets)}")
+            if row['reviewing']:
+                lines.append(f"   📝 Reviewing applications")
+            lines.append(f"   🔗 [View listing]({row['url']})")
+            lines.append("")
+        chunks.append("\n".join(lines))
+    return chunks
 
-def send_telegram_message(text, chunk_size=4000):
+def send_telegram_message(text_chunks):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-    for idx, chunk in enumerate(chunks):
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": chunk,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False,
-        })
-        if r.status_code == 200:
-            print(f"[{time.strftime('%X')}] 📬 Sent part {idx+1}/{len(chunks)}")
-        else:
-            print(f"[{time.strftime('%X')}] ❌ Failed part {idx+1}: {r.text}")
+    for idx, chunk in enumerate(text_chunks, start=1):
+        print(f"\n--- Sending chunk {idx}/{len(text_chunks)} (len={len(chunk)}) ---")
+        print(f"Preview: {repr(chunk[:200])}{'…' if len(chunk) > 200 else ''}")
+        try:
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": chunk,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": False,
+            })
+            if r.status_code == 200:
+                print(f"[{time.strftime('%X')}] 📬 Sent part {idx}/{len(text_chunks)}")
+            else:
+                print(f"[{time.strftime('%X')}] ❌ Failed part {idx}: {r.text}")
+                print("Full chunk content causing error:")
+                print(chunk)
+        except Exception as e:
+            print(f"[{time.strftime('%X')}] ⚠️ Exception sending part {idx}: {e}")
+            print("Full chunk content:")
+            print(chunk)
 
 async def main(test_mode=False):
     global_start = time.time()
@@ -207,10 +219,20 @@ async def main(test_mode=False):
             print(f"[{time.strftime('%X')}] ❌ No listings scraped.")
             return
 
-        # Save and merge
         csv_file = "sits.csv"
         json_file = "sits.json"
-        old_df = pd.read_csv(csv_file) if os.path.exists(csv_file) else pd.DataFrame()
+
+        if os.path.exists(csv_file):
+            if os.path.getsize(csv_file) > 0:
+                old_df = pd.read_csv(csv_file)
+                print(f"[{time.strftime('%X')}] 📁 Loaded {len(old_df)} previous listings.")
+            else:
+                print(f"[{time.strftime('%X')}] ⚠️ Found empty {csv_file}, ignoring.")
+                old_df = pd.DataFrame()
+        else:
+            print(f"[{time.strftime('%X')}] 📁 No existing {csv_file}, starting fresh.")
+            old_df = pd.DataFrame()
+
         new_df = pd.DataFrame(all_rows)
         new_df["expired"] = False
 
@@ -236,8 +258,8 @@ async def main(test_mode=False):
 
         new_sits = merged_df[merged_df["new_this_run"] == True]
         if not new_sits.empty:
-            msg = format_telegram_message(new_sits.to_dict(orient="records"))
-            send_telegram_message(msg)
+            chunks = format_telegram_message(new_sits.to_dict(orient="records"))
+            send_telegram_message(chunks)
 
         print(f"[{time.strftime('%X')}] 🏁 Done in {time.time() - global_start:.2f}s")
 
