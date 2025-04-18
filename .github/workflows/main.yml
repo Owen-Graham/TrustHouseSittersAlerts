@@ -1,16 +1,15 @@
+# .github/workflows/scrape.yml
 name: Scrape TrustedHousesitters
 
 on:
-  # Run on push to main
   push:
     branches:
       - main
 
-  # Run on a schedule every 15 minutes (UTC)
+  # Schedule to run every 15 minutes (UTC)
   schedule:
     - cron: '*/15 * * * *'
 
-  # Allow manual trigger
   workflow_dispatch:
 
 jobs:
@@ -41,6 +40,15 @@ jobs:
 
       - name: Run scraper
         run: python scraper.py
+
+      - name: Upload debug artifacts
+        if: failure()                        # only on error
+        uses: actions/upload-artifact@v4     # publish artifacts
+        with:
+          name: scraper-debug                # artifact set name
+          path: |
+            login_debug.html                 # saved debug HTML
+            login_debug.png                  # saved debug screenshot
 
       - name: Commit updated CSV/JSON
         run: |
