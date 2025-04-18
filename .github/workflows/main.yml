@@ -6,25 +6,29 @@ on:
     branches:
       - main
 
-  # Schedule to run every 15 minutes (UTC)
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *'  # every 15 minutes UTC
 
   workflow_dispatch:
+
+permissions:
+  contents: write  # ✅ Required for pushing commits with GITHUB_TOKEN
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
       THS_EMAIL:         ${{ secrets.THS_EMAIL }}
       THS_PASSWORD:      ${{ secrets.THS_PASSWORD }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
         with:
-          persist-credentials: true
+          persist-credentials: false  # we will override remote manually
           fetch-depth: 0
 
       - name: Set up Python 3.11
@@ -42,13 +46,15 @@ jobs:
         run: python scraper.py
 
       - name: Upload debug artifacts
-        if: always()                         # run even if scraper.py exits zero :contentReference[oaicite:0]{index=0}
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: scraper-debug
           path: |
             login_debug.html
             login_debug.png
+            crash_dump.html
+            before_fill.png
 
       - name: Commit updated CSV/JSON
         run: |
@@ -57,7 +63,7 @@ jobs:
           git add sits.csv sits.json
           if ! git diff --cached --quiet; then
             git commit -m 'chore: update sits.csv + sits.json [skip ci]'
-            git push
+            git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+            git push origin main
           else
             echo "No changes to commit"
-          fi
