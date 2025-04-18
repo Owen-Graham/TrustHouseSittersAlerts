@@ -10,7 +10,6 @@ import argparse
 import time
 import requests
 
-# --- CONFIG ---
 EMAIL = os.environ["THS_EMAIL"]
 PASSWORD = os.environ["THS_PASSWORD"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -88,8 +87,15 @@ async def main(test_mode=False):
         page = await context.new_page()
 
         print(f"[{time.strftime('%X')}] 🚀 Logging in...")
-        await page.goto("https://www.trustedhousesitters.com/")
-        await page.get_by_role("link", name="Log in").click()
+        await page.goto("https://www.trustedhousesitters.com/", wait_until="load")
+        await page.wait_for_selector("body", timeout=10000)
+
+        try:
+            await page.get_by_role("link", name="Log in").click()
+        except:
+            print(f"[{time.strftime('%X')}] ⚠️ 'Log in' button by role failed, trying CSS fallback.")
+            await page.click("a[href='/login']")
+
         await page.get_by_role("textbox", name="Email").fill(EMAIL)
         await page.get_by_role("textbox", name="Password").fill(PASSWORD)
         await page.get_by_role("button", name="Log in").click()
