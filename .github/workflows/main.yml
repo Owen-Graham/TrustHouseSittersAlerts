@@ -1,10 +1,16 @@
-# .github/workflows/scrape.yml
 name: Scrape TrustedHousesitters
 
 on:
+  # Run on push to main
   push:
     branches:
       - main
+
+  # Run on a schedule every 15 minutes (UTC)
+  schedule:
+    - cron: '*/15 * * * *'
+
+  # Allow manual trigger
   workflow_dispatch:
 
 jobs:
@@ -34,8 +40,7 @@ jobs:
           playwright install
 
       - name: Run scraper
-        run: |
-          python scraper.py
+        run: python scraper.py
 
       - name: Commit updated CSV/JSON
         run: |
