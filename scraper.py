@@ -15,11 +15,9 @@ if os.environ.get("GITHUB_ACTIONS") != "true":
     from dotenv import load_dotenv
     load_dotenv()
 
-EMAIL = os.environ["THS_EMAIL"]
-PASSWORD = os.environ["THS_PASSWORD"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-HEADLESS = os.environ.get("GITHUB_ACTIONS") == "true"
+HEADLESS = True  # Always run headless, including in cron
 
 PET_TYPES = ["dog", "cat", "horse", "bird", "fish", "rabbit", "reptile", "poultry", "livestock", "small_pets"]
 
@@ -70,7 +68,7 @@ def format_telegram_message(rows):
                 lines.append(f"   🐾 Pets: {escape_markdown(pets)}")
             if row['reviewing']:
                 lines.append(f"   📝 Reviewing applications")
-            lines.append(f"   🔗 [View listing]({row['url']})")
+            lines.append(f"   🔗 [View listing]({escape_markdown(row['url'])})")
             lines.append("")
         chunks.append("\n".join(lines))
     return chunks
@@ -94,174 +92,171 @@ def send_telegram_message(text_chunks):
                 print("Full chunk content causing error:")
                 print(chunk)
         except Exception as e:
-            print(f"[{time.strftime('%X')}] ⚠️ Exception sending part {idx}: {e}")
+            print(f"[{time.strftime('%X')}] ⚠️ Telegram send exception: {e}")
             print("Full chunk content:")
             print(chunk)
 
 async def main(test_mode=False):
     global_start = time.time()
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context()
-        page = await context.new_page()
+    try:
+        async with async_playwright() as p:
+            # Choose browser engine
+            # browser = await p.firefox.launch(headless=HEADLESS)  # uncomment to use Firefox
+            browser = await p.chromium.launch(headless=HEADLESS)
 
-        print(f"[{time.strftime('%X')}] 🚀 Logging in...")
-        await page.goto("https://www.trustedhousesitters.com/", wait_until="load")
-        await page.wait_for_selector("body", timeout=10000)
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+                locale="en-US"
+            )
 
-        try:
-            await page.get_by_role("link", name="Log in").click()
-            print(f"[{time.strftime('%X')}] 🔐 Clicked 'Log in' using role selector.")
-        except Exception as e1:
-            print(f"[{time.strftime('%X')}] ⚠️ Role-based login failed: {e1}")
-            try:
-                await page.wait_for_selector("a[href='/login']", timeout=10000)
-                await page.click("a[href='/login']")
-                print(f"[{time.strftime('%X')}] 🔐 Clicked 'Log in' using CSS selector.")
-            except Exception as e2:
-                print(f"[{time.strftime('%X')}] ❌ Login failed: {e2}")
-                if os.environ.get("GITHUB_ACTIONS") == "true":
-                    try:
-                        await page.screenshot(path="login_debug.png", full_page=True)
-                        with open("login_debug.html", "w", encoding="utf-8") as f:
-                            f.write(await page.content())
-                        print(f"[{time.strftime('%X')}] 📸 Saved screenshot and HTML for debugging.")
-                    except Exception as debug_e:
-                        print(f"[{time.strftime('%X')}] ⚠️ Could not save debug info: {debug_e}")
-                return
+            # Stealth: prevent detection via navigator.webdriver
+            await context.add_init_script("""Object.defineProperty(navigator, 'webdriver', { get: () => undefined })""")
 
-        try:
-            await page.wait_for_selector("input[placeholder*='Where would you like to go?']", timeout=15000)
-        except:
-            print(f"[{time.strftime('%X')}] ⚠️ Dashboard didn’t load, forcing direct navigation.")
-            await page.goto("https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/")
-            await page.wait_for_selector("input[placeholder*='Where would you like to go?']", timeout=10000)
+            page = await context.new_page()
 
-        print(f"[{time.strftime('%X')}] 🎯 Applying filters...")
-        await page.get_by_role("textbox", name="Search for a location").fill("europe")
-        await page.get_by_text("Europe").click()
-        await wait_like_human()
+            print(f"[{time.strftime('%X')}] 🕵️ Navigating to search page...")
+            await page.goto("https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/", wait_until="networkidle")
+            await wait_like_human(1, 2)
 
-        await page.get_by_role("button", name="Dates").click()
-        for _ in range(6):
-            if await page.locator("text=November 2025").is_visible():
-                break
+            print(f"[{time.strftime('%X')}] 🎯 Applying filters...")
+            await page.screenshot(path="before_fill.png")
+            textbox = page.get_by_role("textbox", name="Search for a location")
+            await textbox.wait_for(timeout=10000)
+            await textbox.fill("europe")
+
+            await page.get_by_text("Europe").click()
+            await wait_like_human()
+
+            await page.get_by_role("button", name="Dates").click()
+            for _ in range(6):
+                if await page.locator("text=November 2025").is_visible():
+                    break
+                await page.get_by_role("button", name="chevron-right").click()
+                await wait_like_human()
+            await page.get_by_label("01 Nov 2025 Saturday").click()
             await page.get_by_role("button", name="chevron-right").click()
             await wait_like_human()
-        await page.get_by_label("01 Nov 2025 Saturday").click()
-        await page.get_by_role("button", name="chevron-right").click()
-        await wait_like_human()
-        await page.get_by_label("24 Dec 2025 Wednesday").click()
-        await wait_like_human()
-        await page.get_by_role("button", name="Apply").click()
-        await wait_like_human(1, 2)
+            await page.get_by_label("24 Dec 2025 Wednesday").click()
+            await wait_like_human()
+            await page.get_by_role("button", name="Apply").click()
+            await wait_like_human(1, 2)
 
-        print(f"[{time.strftime('%X')}] 🕵️ Scraping listings...")
-        all_rows, page_number = [], 0
+            print(f"[{time.strftime('%X')}] 🕵️ Scraping listings...")
+            all_rows, page_number = [], 0
 
-        while True:
-            page_number += 1
-            print(f"[{time.strftime('%X')}] 📄 Page {page_number} loading...")
-            cards = await page.locator('div[data-testid="searchresults_grid_item"]').all()
-            print(f"[{time.strftime('%X')}] 🔍 Found {len(cards)} listings.")
-            if not cards:
-                break
-
-            for i, card in enumerate(cards if not test_mode else cards[:2]):
-                t0 = time.time()
-                try:
-                    title = await card.locator('h3[data-testid="ListingCard__title"]').text_content(timeout=1000)
-                    location = await card.locator('span[data-testid="ListingCard__location"]').text_content(timeout=1000)
-                    town, country = split_location(location)
-                    try:
-                        raw_date = await card.locator("div[class*='UnOOR'] > span").first.text_content(timeout=1000)
-                    except:
-                        raw_date = ""
-                    date_from, date_to = (re.split(r"\s*[-–]\s*", raw_date.replace("+", "").strip()) + [""])[:2]
-                    reviewing = await card.locator('span[data-testid="ListingCard__review__label"]').count() > 0
-                    url_rel = await card.locator("a").get_attribute("href", timeout=1000)
-                    pets = await extract_pets(card)
-                    all_rows.append({
-                        "url": "https://www.trustedhousesitters.com" + url_rel if url_rel else None,
-                        "title": title.strip(),
-                        "location": location.strip(),
-                        "town": town,
-                        "country": country,
-                        "date_from": date_from,
-                        "date_to": date_to,
-                        "reviewing": reviewing,
-                        "expired": False,
-                        "new_this_run": False,
-                        **pets
-                    })
-                    print(f"[{time.strftime('%X')}] ✅ Parsed card {i+1}/{len(cards)} in {time.time() - t0:.2f}s")
-                except Exception as e:
-                    print(f"[{time.strftime('%X')}] ⚠️ Failed to parse card {i+1}: {e}")
-
-            if test_mode:
-                print(f"[{time.strftime('%X')}] 🧪 Test mode: exiting after page 1.")
-                break
-
-            try:
-                next_btn = page.get_by_role("link", name="Go to next page")
-                if await next_btn.is_enabled():
-                    await next_btn.click()
-                    await wait_like_human(1, 2)
-                    await page.wait_for_selector('div[data-testid="searchresults_grid_item"]')
-                else:
+            while True:
+                page_number += 1
+                print(f"[{time.strftime('%X')}] 📄 Page {page_number} loading...")
+                cards = await page.locator('div[data-testid="searchresults_grid_item"]').all()
+                print(f"[{time.strftime('%X')}] 🔍 Found {len(cards)} listings.")
+                if not cards:
                     break
-            except:
-                break
 
-        await browser.close()
+                for i, card in enumerate(cards if not test_mode else cards[:2]):
+                    t0 = time.time()
+                    try:
+                        title = await card.locator('h3[data-testid="ListingCard__title"]').text_content(timeout=1000)
+                        location = await card.locator('span[data-testid="ListingCard__location"]').text_content(timeout=1000)
+                        town, country = split_location(location)
+                        try:
+                            raw_date = await card.locator("div[class*='UnOOR'] > span").first.text_content(timeout=1000)
+                        except:
+                            raw_date = ""
+                        date_from, date_to = (re.split(r"\s*[-–]\s*", raw_date.replace("+", "").strip()) + [""])[:2]
+                        reviewing = await card.locator('span[data-testid="ListingCard__review__label"]').count() > 0
+                        url_rel = await card.locator("a").get_attribute("href", timeout=1000)
+                        pets = await extract_pets(card)
+                        all_rows.append({
+                            "url": "https://www.trustedhousesitters.com" + url_rel if url_rel else None,
+                            "title": title.strip(),
+                            "location": location.strip(),
+                            "town": town,
+                            "country": country,
+                            "date_from": date_from,
+                            "date_to": date_to,
+                            "reviewing": reviewing,
+                            "expired": False,
+                            "new_this_run": False,
+                            **pets
+                        })
+                        print(f"[{time.strftime('%X')}] ✅ Parsed card {i+1}/{len(cards)} in {time.time() - t0:.2f}s")
+                    except Exception as e:
+                        print(f"[{time.strftime('%X')}] ⚠️ Failed to parse card {i+1}: {e}")
 
-        if not all_rows:
-            print(f"[{time.strftime('%X')}] ❌ No listings scraped.")
-            return
+                if test_mode:
+                    print(f"[{time.strftime('%X')}] 🧪 Test mode: exiting after page 1.")
+                    break
 
-        csv_file = "sits.csv"
-        json_file = "sits.json"
+                try:
+                    next_btn = page.get_by_role("link", name="Go to next page")
+                    if await next_btn.is_enabled():
+                        await next_btn.click()
+                        await wait_like_human(1, 2)
+                        await page.wait_for_selector('div[data-testid="searchresults_grid_item"]')
+                    else:
+                        break
+                except:
+                    break
 
-        if os.path.exists(csv_file):
-            if os.path.getsize(csv_file) > 0:
+            await browser.close()
+
+            if not all_rows:
+                print(f"[{time.strftime('%X')}] ❌ No listings scraped.")
+                return
+
+            csv_file = "sits.csv"
+            json_file = "sits.json"
+
+            if os.path.exists(csv_file) and os.path.getsize(csv_file) > 0:
                 old_df = pd.read_csv(csv_file)
                 print(f"[{time.strftime('%X')}] 📁 Loaded {len(old_df)} previous listings.")
             else:
-                print(f"[{time.strftime('%X')}] ⚠️ Found empty {csv_file}, ignoring.")
                 old_df = pd.DataFrame()
-        else:
-            print(f"[{time.strftime('%X')}] 📁 No existing {csv_file}, starting fresh.")
-            old_df = pd.DataFrame()
 
-        new_df = pd.DataFrame(all_rows)
-        new_df["expired"] = False
+            new_df = pd.DataFrame(all_rows)
+            new_df["expired"] = False
 
-        if not old_df.empty:
-            old_urls = set(old_df["url"].dropna())
-            new_df["new_this_run"] = ~new_df["url"].isin(old_urls)
-            old_df["expired"] = True
-            merged_df = pd.concat([
-                new_df,
-                old_df[~old_df["url"].isin(new_df["url"])]
-            ], ignore_index=True)
-        else:
-            new_df["new_this_run"] = True
-            merged_df = new_df
+            if not old_df.empty:
+                old_urls = set(old_df["url"].dropna())
+                new_df["new_this_run"] = ~new_df["url"].isin(old_urls)
+                old_df["expired"] = True
+                merged_df = pd.concat([
+                    new_df,
+                    old_df[~old_df["url"].isin(new_df["url"])]
+                ], ignore_index=True)
+            else:
+                new_df["new_this_run"] = True
+                merged_df = new_df
 
-        for col in ["url", "title", "location", "town", "country", "date_from", "date_to", "reviewing", "expired", "new_this_run", *PET_TYPES]:
-            if col not in merged_df:
-                merged_df[col] = 0 if col in PET_TYPES else ""
+            for col in ["url", "title", "location", "town", "country", "date_from", "date_to", "reviewing", "expired", "new_this_run", *PET_TYPES]:
+                if col not in merged_df:
+                    merged_df[col] = 0 if col in PET_TYPES else ""
 
-        merged_df.sort_values("date_from").to_csv(csv_file, index=False, quoting=csv.QUOTE_NONNUMERIC, quotechar='"')
-        merged_df.to_json(json_file, orient="records", indent=2)
-        print(f"[{time.strftime('%X')}] ✅ Saved CSV and JSON")
+            merged_df.sort_values("date_from").to_csv(csv_file, index=False, quoting=csv.QUOTE_NONNUMERIC, quotechar='"')
+            merged_df.to_json(json_file, orient="records", indent=2)
+            print(f"[{time.strftime('%X')}] ✅ Saved CSV and JSON")
 
-        new_sits = merged_df[merged_df["new_this_run"] == True]
-        if not new_sits.empty:
-            chunks = format_telegram_message(new_sits.to_dict(orient="records"))
-            send_telegram_message(chunks)
+            new_sits = merged_df[merged_df["new_this_run"] == True]
+            if not new_sits.empty:
+                chunks = format_telegram_message(new_sits.to_dict(orient="records"))
+                send_telegram_message(chunks)
 
-        print(f"[{time.strftime('%X')}] 🏁 Done in {time.time() - global_start:.2f}s")
+            print(f"[{time.strftime('%X')}] 🏁 Done in {time.time() - global_start:.2f}s")
+
+    except Exception as e:
+        print(f"[{time.strftime('%X')}] ❌ Unhandled exception: {e}")
+        try:
+            if 'page' in locals() and page:
+                html = await page.content()
+                with open("crash_dump.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                print(f"[{time.strftime('%X')}] 💾 Saved crash HTML to crash_dump.html")
+            else:
+                print(f"[{time.strftime('%X')}] ⚠️ Page not available to dump HTML")
+        except Exception as dump_err:
+            print(f"[{time.strftime('%X')}] ⚠️ Failed to save crash HTML: {dump_err}")
+        raise
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
