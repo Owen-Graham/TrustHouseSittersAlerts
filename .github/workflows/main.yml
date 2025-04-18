@@ -11,11 +11,10 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     env:
-      # these will be picked up by scraper.py
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      EMAIL:              ${{ secrets.EMAIL }}
-      PASSWORD:           ${{ secrets.PASSWORD }}
+      TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+      THS_EMAIL:         ${{ secrets.THS_EMAIL }}
+      THS_PASSWORD:      ${{ secrets.THS_PASSWORD }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
@@ -35,7 +34,6 @@ jobs:
           playwright install
 
       - name: Run scraper
-        # GitHub Actions is headless by default; scraper.py should detect GITHUB_ACTIONS and run headless
         run: |
           python scraper.py
 
