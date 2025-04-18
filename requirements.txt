@@ -1,3 +1,4 @@
 playwright>=1.42
 pandas
 requests
+python-dotenv
