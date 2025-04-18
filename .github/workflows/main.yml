@@ -1,45 +1,52 @@
-name: TrustHouseSittersAlerts
+# .github/workflows/scrape.yml
+name: Scrape TrustedHousesitters
 
 on:
-  schedule:
-    # Every hour
-    - cron: '0 * * * *'
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    env:
+      # these will be picked up by scraper.py
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      EMAIL:              ${{ secrets.EMAIL }}
+      PASSWORD:           ${{ secrets.PASSWORD }}
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          persist-credentials: true
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright pandas requests python-dotenv
+          playwright install
 
       - name: Run scraper
-        run: python scraper.py
-
-      - name: Commit new sits
+        # GitHub Actions is headless by default; scraper.py should detect GITHUB_ACTIONS and run headless
         run: |
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          python scraper.py
+
+      - name: Commit updated CSV/JSON
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add sits.csv sits.json
-          git commit -m "ci: update sits"
-          git push
-
-      - name: Upload outputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: trusthouse‑sits
-          path: |
-            sits.csv
-            sits.json
-
-      # Uncomment this section only if deploying to GitHub Pages
-      # - name: Upload Pages artifact
-      #   uses: actions/upload-pages-artifact@v1
-      #   with:
-      #     path: .
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: update sits.csv + sits.json [skip ci]'
+            git push
+          else
+            echo "No changes to commit"
+          fi
