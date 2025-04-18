@@ -24,15 +24,12 @@ HEADLESS = os.environ.get("GITHUB_ACTIONS") == "true"
 PET_TYPES = ["dog", "cat", "horse", "bird", "fish", "rabbit", "reptile", "poultry", "livestock", "small_pets"]
 
 def normalize_pet(pet):
-    pet = pet.lower().strip()
-    pet = pet.replace("small pet", "small_pets")
+    pet = pet.lower().strip().replace("small pet", "small_pets")
     return pet.replace(" ", "_")
 
 def split_location(location):
     parts = [p.strip() for p in location.rsplit(",", maxsplit=1)]
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    return location, ""
+    return (parts[0], parts[1]) if len(parts) == 2 else (location, "")
 
 def escape_markdown(text):
     if not isinstance(text, str):
@@ -50,18 +47,18 @@ async def extract_pets(card):
         return counts
     for item in pet_items:
         try:
-            count_text = await item.locator('span[data-testid="Animal__count"]').text_content(timeout=1000)
+            count = await item.locator('span[data-testid="Animal__count"]').text_content(timeout=1000)
             pet_type = await item.locator("svg title").text_content(timeout=1000)
             pet = normalize_pet(pet_type)
             if pet in counts:
-                counts[pet] += int(count_text.strip())
+                counts[pet] += int(count.strip())
         except:
             continue
     return counts
 
-def format_telegram_message(new_rows):
+def format_telegram_message(rows):
     lines = ["🔔 *New TrustedHousesitters Listings:*", ""]
-    for i, row in enumerate(new_rows, 1):
+    for i, row in enumerate(rows, 1):
         pets = ", ".join([f"{row[p]} {p}" for p in PET_TYPES if row.get(p, 0)])
         lines.append(f"{i}. *{escape_markdown(row['title'])}*")
         lines.append(f"   📍 {escape_markdown(row['town'])}, {escape_markdown(row['country'])}")
@@ -78,13 +75,12 @@ def send_telegram_message(text, chunk_size=4000):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
     for idx, chunk in enumerate(chunks):
-        payload = {
+        r = requests.post(url, json={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": chunk,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False,
-        }
-        r = requests.post(url, json=payload)
+        })
         if r.status_code == 200:
             print(f"[{time.strftime('%X')}] 📬 Sent part {idx+1}/{len(chunks)}")
         else:
@@ -103,23 +99,33 @@ async def main(test_mode=False):
 
         try:
             await page.get_by_role("link", name="Log in").click()
-        except:
-            print(f"[{time.strftime('%X')}] ⚠️ 'Log in' button by role failed, trying CSS fallback.")
-            await page.click("a[href='/login']")
-
-        await page.get_by_role("textbox", name="Email").fill(EMAIL)
-        await page.get_by_role("textbox", name="Password").fill(PASSWORD)
-        await page.get_by_role("button", name="Log in").click()
+            print(f"[{time.strftime('%X')}] 🔐 Clicked 'Log in' using role selector.")
+        except Exception as e1:
+            print(f"[{time.strftime('%X')}] ⚠️ Role-based login failed: {e1}")
+            try:
+                await page.wait_for_selector("a[href='/login']", timeout=10000)
+                await page.click("a[href='/login']")
+                print(f"[{time.strftime('%X')}] 🔐 Clicked 'Log in' using CSS selector.")
+            except Exception as e2:
+                print(f"[{time.strftime('%X')}] ❌ Login failed: {e2}")
+                if os.environ.get("GITHUB_ACTIONS") == "true":
+                    try:
+                        await page.screenshot(path="login_debug.png", full_page=True)
+                        with open("login_debug.html", "w", encoding="utf-8") as f:
+                            f.write(await page.content())
+                        print(f"[{time.strftime('%X')}] 📸 Saved screenshot and HTML for debugging.")
+                    except Exception as debug_e:
+                        print(f"[{time.strftime('%X')}] ⚠️ Could not save debug info: {debug_e}")
+                return
 
         try:
             await page.wait_for_selector("input[placeholder*='Where would you like to go?']", timeout=15000)
         except:
-            print(f"[{time.strftime('%X')}] ⚠️ Dashboard didn't load, forcing page manually.")
+            print(f"[{time.strftime('%X')}] ⚠️ Dashboard didn’t load, forcing direct navigation.")
             await page.goto("https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/")
             await page.wait_for_selector("input[placeholder*='Where would you like to go?']", timeout=10000)
 
         print(f"[{time.strftime('%X')}] 🎯 Applying filters...")
-        await page.get_by_role("textbox", name="Search for a location").click()
         await page.get_by_role("textbox", name="Search for a location").fill("europe")
         await page.get_by_text("Europe").click()
         await wait_like_human()
@@ -130,7 +136,6 @@ async def main(test_mode=False):
                 break
             await page.get_by_role("button", name="chevron-right").click()
             await wait_like_human()
-
         await page.get_by_label("01 Nov 2025 Saturday").click()
         await page.get_by_role("button", name="chevron-right").click()
         await wait_like_human()
@@ -139,48 +144,33 @@ async def main(test_mode=False):
         await page.get_by_role("button", name="Apply").click()
         await wait_like_human(1, 2)
 
-        print(f"[{time.strftime('%X')}] 🕵️ Starting scrape...")
-        all_rows = []
-        page_number = 0
+        print(f"[{time.strftime('%X')}] 🕵️ Scraping listings...")
+        all_rows, page_number = [], 0
 
         while True:
             page_number += 1
             print(f"[{time.strftime('%X')}] 📄 Page {page_number} loading...")
             cards = await page.locator('div[data-testid="searchresults_grid_item"]').all()
             print(f"[{time.strftime('%X')}] 🔍 Found {len(cards)} listings.")
-
             if not cards:
                 break
 
-            num_cards = len(cards) if not test_mode else min(2, len(cards))
-            for i in range(num_cards):
+            for i, card in enumerate(cards if not test_mode else cards[:2]):
                 t0 = time.time()
                 try:
-                    card = cards[i]
                     title = await card.locator('h3[data-testid="ListingCard__title"]').text_content(timeout=1000)
                     location = await card.locator('span[data-testid="ListingCard__location"]').text_content(timeout=1000)
                     town, country = split_location(location)
-
                     try:
                         raw_date = await card.locator("div[class*='UnOOR'] > span").first.text_content(timeout=1000)
                     except:
                         raw_date = ""
-
-                    raw_date = raw_date.replace("+", "").strip()
-                    split_date = re.split(r"\s*[-–]\s*", raw_date)
-                    date_from, date_to = (split_date + [""])[:2]
-
+                    date_from, date_to = (re.split(r"\s*[-–]\s*", raw_date.replace("+", "").strip()) + [""])[:2]
                     reviewing = await card.locator('span[data-testid="ListingCard__review__label"]').count() > 0
+                    url_rel = await card.locator("a").get_attribute("href", timeout=1000)
                     pets = await extract_pets(card)
-
-                    try:
-                        url_rel = await card.locator("a").get_attribute("href", timeout=1000)
-                        url = "https://www.trustedhousesitters.com" + url_rel if url_rel else None
-                    except:
-                        url = None
-
-                    row = {
-                        "url": url,
+                    all_rows.append({
+                        "url": "https://www.trustedhousesitters.com" + url_rel if url_rel else None,
                         "title": title.strip(),
                         "location": location.strip(),
                         "town": town,
@@ -191,14 +181,13 @@ async def main(test_mode=False):
                         "expired": False,
                         "new_this_run": False,
                         **pets
-                    }
-                    all_rows.append(row)
-                    print(f"[{time.strftime('%X')}] ✅ Parsed card {i+1}/{num_cards} in {time.time() - t0:.2f}s")
+                    })
+                    print(f"[{time.strftime('%X')}] ✅ Parsed card {i+1}/{len(cards)} in {time.time() - t0:.2f}s")
                 except Exception as e:
-                    print(f"[{time.strftime('%X')}] ⚠️ Error parsing listing {i}: {e}")
+                    print(f"[{time.strftime('%X')}] ⚠️ Failed to parse card {i+1}: {e}")
 
             if test_mode:
-                print(f"[{time.strftime('%X')}] 🧪 Test mode active. Stopping after first page.")
+                print(f"[{time.strftime('%X')}] 🧪 Test mode: exiting after page 1.")
                 break
 
             try:
@@ -218,14 +207,10 @@ async def main(test_mode=False):
             print(f"[{time.strftime('%X')}] ❌ No listings scraped.")
             return
 
+        # Save and merge
         csv_file = "sits.csv"
         json_file = "sits.json"
-
-        if os.path.exists(csv_file):
-            old_df = pd.read_csv(csv_file)
-        else:
-            old_df = pd.DataFrame()
-
+        old_df = pd.read_csv(csv_file) if os.path.exists(csv_file) else pd.DataFrame()
         new_df = pd.DataFrame(all_rows)
         new_df["expired"] = False
 
@@ -245,12 +230,9 @@ async def main(test_mode=False):
             if col not in merged_df:
                 merged_df[col] = 0 if col in PET_TYPES else ""
 
-        merged_df = merged_df.sort_values(by="date_from")
-        merged_df.to_csv(csv_file, index=False, quoting=csv.QUOTE_NONNUMERIC, quotechar='"')
+        merged_df.sort_values("date_from").to_csv(csv_file, index=False, quoting=csv.QUOTE_NONNUMERIC, quotechar='"')
         merged_df.to_json(json_file, orient="records", indent=2)
-
-        print(f"[{time.strftime('%X')}] ✅ Saved CSV to {csv_file}")
-        print(f"[{time.strftime('%X')}] ✅ Saved JSON to {json_file}")
+        print(f"[{time.strftime('%X')}] ✅ Saved CSV and JSON")
 
         new_sits = merged_df[merged_df["new_this_run"] == True]
         if not new_sits.empty:
