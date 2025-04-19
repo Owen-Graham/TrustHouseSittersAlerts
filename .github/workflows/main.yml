@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/15 * * * *'  # Every 15 minutes UTC
   workflow_dispatch:
 
 permissions:
@@ -17,9 +17,9 @@ jobs:
 
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      THS_EMAIL: ${{ secrets.THS_EMAIL }}
-      THS_PASSWORD: ${{ secrets.THS_PASSWORD }}
+      TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+      THS_EMAIL:         ${{ secrets.THS_EMAIL }}
+      THS_PASSWORD:      ${{ secrets.THS_PASSWORD }}
 
     steps:
       - name: Checkout repository
@@ -64,3 +64,4 @@ jobs:
             git push origin main
           else
             echo "No changes to commit"
+          fi    # <— this closes the if block!
