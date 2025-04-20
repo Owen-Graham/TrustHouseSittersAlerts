@@ -42,6 +42,13 @@ jobs:
       - name: Run scraper
         run: python scraper.py
 
+      - name: Upload scraper log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-log
+          path: scraper.log
+
       - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -64,4 +71,4 @@ jobs:
             git push origin main
           else
             echo "No changes to commit"
-          fi    # <— this closes the if block!
+          fi
