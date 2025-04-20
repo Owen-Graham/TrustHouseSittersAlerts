@@ -88,8 +88,16 @@ def format_telegram_message(rows: list[dict]) -> list[str]:
             lines.append(f"{idx}. *{escape_markdown(row['title'])}*")
             lines.append(f"   📍 {escape_markdown(row['town'])}, {escape_markdown(row['country'])}")
             lines.append(f"   📅 {escape_markdown(row['date_from'])} → {escape_markdown(row['date_to'])}")
-            if pets: lines.append(f"   🐾 {escape_markdown(pets)}")
-            if row.get('reviewing'): lines.append(f"   📝 Reviewing applications")
+            # Pet count
+            if pets:
+                lines.append(f"   🐾 {escape_markdown(pets)}")
+            # Review status
+            if row.get('reviewing'):
+                lines.append(f"   📝 Reviewing applications")
+            # New fields: transport & car
+            lines.append(f"   🚗 Car included: {'Yes' if row.get('car_included') else 'No'}")
+            lines.append(f"   🚌 Public transport: {'Yes' if row.get('public_transport') else 'No'}")
+            # Link
             lines.append(f"   🔗 [View listing]({row['url']})")
             lines.append("")
         chunks.append("\n".join(lines))
