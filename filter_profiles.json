@@ -1,4 +1,22 @@
 {
+  "europe": {
+    "search": {
+      "location": "europe",
+      "date_from": "01 Nov 2025",
+      "date_to": "24 Dec 2025"
+    },
+    "filters": {
+      "excluded_countries": ["United Kingdom", "Ireland"],
+      "max_pets": {
+        "dog": 2,
+        "cat": 3
+      }
+    },
+    "notification": {
+      "header": "🏰 EUROPE SITS 🏰",
+      "icon": "🇪🇺"
+    }
+  },
   "asia": {
     "search": {
       "location": "asia",
