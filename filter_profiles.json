@@ -1,0 +1,20 @@
+{
+  "asia": {
+    "search": {
+      "location": "asia",
+      "date_from": "01 Oct 2025",
+      "date_to": "22 Dec 2025"
+    },
+    "filters": {
+      "excluded_countries": [],
+      "max_pets": {
+        "dog": 2,
+        "cat": 2
+      }
+    },
+    "notification": {
+      "header": "🌏 ASIA SITS 🌏",
+      "icon": "🌏"
+    }
+  }
+}
