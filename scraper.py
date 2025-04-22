@@ -31,7 +31,7 @@ if os.environ.get("GITHUB_ACTIONS") != "true":
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-HEADLESS = False  # Set to False for debugging
+HEADLESS = True  # Set to False for debugging
 
 # --- Configuration ---
 BASE_URL = "https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/"
