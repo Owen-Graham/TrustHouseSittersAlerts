@@ -26,7 +26,6 @@ logging.basicConfig(
 # --- Load environment variables ---
 if os.environ.get("GITHUB_ACTIONS") != "true":
     from dotenv import load_dotenv
-
     load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -507,58 +506,47 @@ async def process_profile(profile_name, profile_config, test_mode=False):
             locale='en-US'
         )
         await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-        page = await ctx.new_page()
-        runs = {}
 
-        # Run all three searches
-        for mode in MODES:
+        async def run_mode(mode):
+            page = await ctx.new_page()
             try:
                 await initial_search(page, profile_config)
-
-                # Check if we got the no results message before trying to apply filters
                 no_results = await page.locator("text=We're waiting on house and pet sitting opportunities").count() > 0
                 if no_results:
                     logging.info(f"No results available for profile {profile_name}, mode {mode}")
-                    runs[mode] = []
-                    continue
-
+                    return mode, []
                 await apply_filters(page, mode)
-                runs[mode] = await scrape_run(page, test_mode)
-                logging.info(f"Found {len(runs[mode])} results for {profile_name}, mode {mode}")
+                results = await scrape_run(page, test_mode)
+                logging.info(f"Found {len(results)} results for {profile_name}, mode {mode}")
+                return mode, results
             except Exception as e:
                 logging.critical(f"Mode {mode} failed for profile {profile_name}: {e}", exc_info=True)
                 html = await page.content()
                 with open(f"crash_dump_{profile_name}_{mode}.html", "w") as f:
                     f.write(html)
                 await page.screenshot(path=f"crash_screenshot_{profile_name}_{mode}.png", full_page=True)
-                runs[mode] = []
+                return mode, []
 
+        results = await asyncio.gather(*(run_mode(mode) for mode in MODES))
         await browser.close()
 
-    # Process the results
+    runs = dict(results)
+
     base_df = pd.DataFrame(runs.get(None, []))
     if base_df.empty:
         logging.warning(f"No results found for profile {profile_name}")
         return pd.DataFrame()
 
     now = datetime.utcnow().isoformat() + 'Z'
-
-    # Extract listing IDs instead of full URLs for comparison
     public_transport_ids = [listing_id_from_url(r['url']) for r in runs.get('public_transport', [])]
     car_included_ids = [listing_id_from_url(r['url']) for r in runs.get('car_included', [])]
 
-    logging.info(f"Base search found {len(base_df)} listings")
-    logging.info(f"Public transport search found {len(public_transport_ids)} listing IDs")
-    logging.info(f"Car included search found {len(car_included_ids)} listing IDs")
-
-    # For each listing in the base results, log transportation status using IDs
     for idx, row in base_df.iterrows():
         listing_id = row['listing_id']
         pt_match = listing_id in public_transport_ids
         car_match = listing_id in car_included_ids
         logging.info(f"Listing {listing_id} - Public transport: {pt_match}, Car included: {car_match}")
 
-    # Set transportation flags using listing IDs
     base_df['public_transport'] = base_df['listing_id'].isin(public_transport_ids).astype(bool)
     base_df['car_included'] = base_df['listing_id'].isin(car_included_ids).astype(bool)
     base_df['unique_key'] = base_df['listing_id'] + '|' + base_df['date_range']
@@ -567,32 +555,36 @@ async def process_profile(profile_name, profile_config, test_mode=False):
     logging.info(f"Profile {profile_name} completed in {time.time() - start_time:.2f}s, found {len(base_df)} listings")
     return base_df
 
-
+# --- Modify main to run profiles in parallel (unchanged if already done) ---
 async def main(test_mode=False) -> None:
     logging.info("Starting scrape")
     start_time = time.time()
 
-    # Load profiles
     profiles = load_profiles()
     logging.info(f"Loaded {len(profiles)} search profiles")
 
-    all_results = []
-    for profile_name, profile_config in profiles.items():
+    async def run_profile(name, config):
         try:
-            profile_results = await process_profile(profile_name, profile_config, test_mode)
-            if not profile_results.empty:
-                all_results.append(profile_results)
+            return name, await process_profile(name, config, test_mode)
         except Exception as e:
-            logging.error(f"Failed to process profile {profile_name}: {e}", exc_info=True)
+            logging.error(f"Failed to process profile {name}: {e}", exc_info=True)
+            return name, e
+
+    results = await asyncio.gather(*(run_profile(name, config) for name, config in profiles.items()))
+
+    all_results = []
+    for name, result in results:
+        if isinstance(result, pd.DataFrame) and not result.empty:
+            all_results.append(result)
+        elif isinstance(result, Exception):
+            logging.error(f"Profile {name} raised exception: {result}", exc_info=True)
 
     if not all_results:
         logging.warning("No results found for any profile")
         return
 
-    # Combine results from all profiles
     base_df = pd.concat(all_results, ignore_index=True)
 
-    # Load history
     if os.path.exists(JSON_PATH) and os.path.getsize(JSON_PATH) > 0:
         try:
             old_df = pd.read_json(JSON_PATH)
@@ -602,7 +594,6 @@ async def main(test_mode=False) -> None:
     else:
         old_df = pd.DataFrame()
 
-    # Cast booleans and timestamps
     old_df['public_transport'] = old_df.get('public_transport', False).fillna(False).astype(bool)
     old_df['car_included'] = old_df.get('car_included', False).fillna(False).astype(bool)
     default_fs = (datetime.utcnow() - timedelta(seconds=1)).isoformat() + 'Z'
@@ -614,10 +605,8 @@ async def main(test_mode=False) -> None:
             lambda r: listing_id_from_url(r['url']) + '|' + f"{r['date_from']}→{r['date_to']}", axis=1
         )
 
-    # Merge current and previous data
     merged = old_df.set_index('unique_key').combine_first(base_df.set_index('unique_key'))
 
-    # Track changes
     now = datetime.utcnow().isoformat() + 'Z'
     for uk, row in merged.iterrows():
         if uk in base_df['unique_key'].values:
@@ -627,14 +616,12 @@ async def main(test_mode=False) -> None:
                 nr[col] != orow[col] for col in CONTENT_COLS + ['public_transport', 'car_included']
             )
             merged.at[uk, 'last_changed'] = now if changed else row['last_changed']
-            # Update profile assignment
             merged.at[uk, 'profile'] = nr['profile']
 
     merged['first_seen'] = merged['first_seen'].fillna(now)
     df = merged.reset_index()
     df['new_this_run'] = df['first_seen'] == now
 
-    # Mark expired listings
     old_keys = set(old_df['unique_key'])
     new_keys = set(df['unique_key'])
     exp_keys = old_keys - new_keys
@@ -643,36 +630,23 @@ async def main(test_mode=False) -> None:
     exp_df['new_this_run'] = False
     df['expired'] = False
 
-    # Combine everything
     out_df = pd.concat([df, exp_df], ignore_index=True)
 
-    # Save the combined data
     out_df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_NONNUMERIC)
     out_df.to_json(JSON_PATH, orient='records', indent=2)
     logging.info(f"Saved {len(out_df)} records")
 
-    # Send alerts for each profile
     for profile_name, profile_config in profiles.items():
-        # Filter new listings for this profile
-        profile_df = out_df[
-            (out_df['new_this_run']) &
-            (out_df['profile'] == profile_name)
-            ]
-
-        # Apply profile-specific filters
+        profile_df = out_df[(out_df['new_this_run']) & (out_df['profile'] == profile_name)]
         profile_df = apply_profile_filters(profile_df, profile_config)
 
         if profile_df.empty:
             logging.info(f"No new listings to alert for profile {profile_name}")
         else:
             logging.info(f"Sending {len(profile_df)} alerts for profile {profile_name}")
-            send_telegram_message(format_telegram_message(
-                profile_df.to_dict('records'),
-                profile_config
-            ))
+            send_telegram_message(format_telegram_message(profile_df.to_dict('records'), profile_config))
 
     logging.info(f"Done in {time.time() - start_time:.2f}s")
-
 
 if __name__ == '__main__':
     try:
