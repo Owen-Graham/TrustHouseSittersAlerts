@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '*/15 * * * *'  # Every 15 minutes UTC
+    - cron: '*/55 * * * *'  # Every 55 minutes
   workflow_dispatch:
 
 permissions:
