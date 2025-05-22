@@ -34,5 +34,24 @@
       "header": "🌏 ASIA SITS 🌏",
       "icon": "🌏"
     }
+  },
+  "uk_with_car": {
+    "search": {
+      "location": "United Kingdom",
+      "date_from": "01 Nov 2025",
+      "date_to": "24 Dec 2025"
+    },
+    "filters": {
+      "excluded_countries": [],
+      "max_pets": {
+        "dog": 2,
+        "cat": 3
+      },
+      "car_included": true
+    },
+    "notification": {
+      "header": "🇬🇧 UK SITS WITH CAR 🚗",
+      "icon": "🇬🇧"
+    }
   }
 }
