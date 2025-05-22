@@ -594,8 +594,16 @@ async def main(test_mode=False) -> None:
     else:
         old_df = pd.DataFrame()
 
-    old_df['public_transport'] = old_df.get('public_transport', False).fillna(False).astype(bool)
-    old_df['car_included'] = old_df.get('car_included', False).fillna(False).astype(bool)
+    if 'public_transport' not in old_df.columns:
+        old_df['public_transport'] = False
+    else:
+        old_df['public_transport'] = old_df['public_transport'].fillna(False)
+    old_df['public_transport'] = old_df['public_transport'].astype(bool)
+    if 'car_included' not in old_df.columns:
+        old_df['car_included'] = False
+    else:
+        old_df['car_included'] = old_df['car_included'].fillna(False)
+    old_df['car_included'] = old_df['car_included'].astype(bool)
     default_fs = (datetime.utcnow() - timedelta(seconds=1)).isoformat() + 'Z'
     old_df['first_seen'] = old_df.get('first_seen', default_fs)
     old_df['last_changed'] = old_df.get('last_changed', old_df['first_seen'])
