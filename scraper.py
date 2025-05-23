@@ -36,7 +36,7 @@ HEADLESS = True  # Set to False for debugging
 BASE_URL = "https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/"
 PET_TYPES = ["dog", "cat", "horse", "bird", "fish", "rabbit", "reptile", "poultry", "livestock", "small_pets"]
 CONTENT_COLS = ["title", "location", "town", "country", "date_from", "date_to", "reviewing"] + PET_TYPES
-MODES = ['public_transport', 'car_included', None]
+# MODES = ['public_transport', 'car_included', None] # Removed as per refactoring for single-pass scraping
 CSV_PATH = "sits.csv"
 JSON_PATH = "sits.json"
 PROFILES_PATH = "filter_profiles.json"
@@ -64,19 +64,58 @@ def escape_markdown(text: str) -> str:
 
 async def extract_pets(card) -> dict:
     counts = {p: 0 for p in PET_TYPES}
+    # Uses Playwright's evaluate_all to efficiently extract pet details in a single browser-side operation,
+    # minimizing back-and-forth communication between Playwright and the browser.
+    js_script = """
+    ulElement => {
+        const petData = [];
+        if (!ulElement) return petData; // Should not happen if locator finds the ul
+        
+        const items = ulElement.querySelectorAll('li');
+        items.forEach(item => {
+            try {
+                const countEl = item.querySelector('span[data-testid="Animal__count"]');
+                const typeEl = item.querySelector('svg title');
+                
+                if (countEl && typeEl) {
+                    petData.push({
+                        count: countEl.textContent.trim(),
+                        type: typeEl.textContent.trim()
+                    });
+                }
+            } catch (e) {
+                // Log error in browser console if needed, or ignore individual item errors
+                console.error('Error processing pet item:', e);
+            }
+        });
+        return petData;
+    }
+    """
+    
     try:
-        items = await card.locator('ul[data-testid="animals-list"] li').all()
-    except Exception:
-        return counts
-    for it in items:
-        try:
-            cnt = await it.locator('span[data-testid="Animal__count"]').text_content(timeout=1000)
-            ptype = await it.locator('svg title').text_content(timeout=1000)
-            key = normalize_pet(ptype)
-            if key in counts:
-                counts[key] += int(cnt.strip())
-        except Exception:
-            continue
+        # Ensure the main list exists before trying to evaluate all
+        animals_list_locator = card.locator('ul[data-testid="animals-list"]')
+        if await animals_list_locator.count() == 0:
+            logging.debug("No 'animals-list' found for a card.")
+            return counts
+
+        pet_details_list = await animals_list_locator.evaluate_all(js_script)
+        
+        for pet_detail in pet_details_list:
+            try:
+                key = normalize_pet(pet_detail['type'])
+                if key in counts:
+                    counts[key] += int(pet_detail['count'])
+            except (ValueError, KeyError) as e:
+                logging.warning(f"Could not parse pet detail: {pet_detail}. Error: {e}")
+                continue
+                
+    except Exception as e:
+        # This catches errors from evaluate_all or if the locator itself fails initially
+        logging.error(f"Error in extract_pets with evaluate_all: {e}")
+        # Fallback or re-throw: For now, returning empty counts on major error
+        return {p: 0 for p in PET_TYPES} # Return fresh empty counts
+        
     return counts
 
 
@@ -84,6 +123,16 @@ def listing_id_from_url(url: str) -> str:
     m = re.search(r'/l/(\d+)(?:/|$)', url)
     return m.group(1) if m else url
 
+def format_date_for_url(date_str: str) -> str:
+    """Converts 'DD Mon YYYY' (e.g., '01 Nov 2025') to 'YYYY-MM-DD'."""
+    if not date_str:
+        return ""
+    try:
+        dt_obj = datetime.strptime(date_str, "%d %b %Y")
+        return dt_obj.strftime("%Y-%m-%d")
+    except ValueError:
+        logging.warning(f"Could not parse date string: {date_str}")
+        return ""
 
 def load_profiles() -> dict:
     """Load search profiles from configuration file"""
@@ -169,336 +218,363 @@ def send_telegram_message(chunks: list[str]) -> None:
 
 
 # --- Browser interactions ---
-async def initial_search(page, profile_config) -> None:
-    logging.info(f"Initial search setup for {profile_config['search']['location']}")
+async def initial_search(page, profile_config, test_mode=False) -> None: 
+    location_query = profile_config["search"]["location"]
+    date_from_str = profile_config["search"]["date_from"]
+    date_to_str = profile_config["search"]["date_to"]
+
+    formatted_date_from = format_date_for_url(date_from_str)
+    formatted_date_to = format_date_for_url(date_to_str)
+
+    # Method 1: Attempt to set dates directly via URL parameters for efficiency.
+    # This is speculative as actual URL parameters are unknown without dev tools.
+    # If successful, this bypasses complex UI interactions for date selection.
+    url_to_try_with_dates = "" 
+    
+    logging.info(f"Initial search setup for {location_query}")
     await page.goto(BASE_URL, wait_until='networkidle')
     await wait_like_human()
+    # Conditional screenshot: Captures the initial page if in test_mode.
+    if test_mode:
+        await page.screenshot(path=f"debug_initial_page_{location_query}.png")
 
-    # Take a screenshot to help with debugging
-    await page.screenshot(path=f"debug_initial_{profile_config['search']['location']}.png")
-
-    # Fill location
+    # Fill location (UI-based)
     box = page.locator("input[placeholder*='Where would you like to go?']")
     await box.wait_for(timeout=15000)
-    location = profile_config["search"]["location"]
-    await box.fill(location)
+    await box.fill(location_query)
     await wait_like_human()
 
-    # For Europe, click the first exact match
-    if location.lower() == "europe":
+    if location_query.lower() == "europe":
         await page.locator("text=Europe").first.click()
-    # For Asia, be more specific to handle multiple matches
-    elif location.lower() == "asia":
+    elif location_query.lower() == "asia":
         await page.locator("span").filter(has_text="Asia").first.click()
     else:
-        # For other locations, use the capitalized name
-        await page.locator(f"text={location.capitalize()}").first.click()
-
+        await page.locator(f"text={location_query.capitalize()}").first.click()
     await wait_like_human()
+    
+    current_url_after_location = page.url
+    logging.info(f"URL after location selection: {current_url_after_location}")
 
-    # Set dates
+    # Attempt to use URL parameters for dates if available
+    if formatted_date_from and formatted_date_to:
+        date_params = f"availability_start_date={formatted_date_from}&availability_end_date={formatted_date_to}"
+        if "?" in current_url_after_location: 
+            url_to_try_with_dates = f"{current_url_after_location}&{date_params}"
+        else: 
+            url_to_try_with_dates = f"{current_url_after_location}?{date_params}"
+        
+        logging.info(f"Attempting to navigate with date URL: {url_to_try_with_dates}")
+        try:
+            await page.goto(url_to_try_with_dates, wait_until='networkidle', timeout=10000) 
+            await wait_like_human(1,2) 
+            # Conditional screenshot: Captures page after attempting URL-based date setting.
+            if test_mode:
+                await page.screenshot(path=f"debug_date_url_attempt_{location_query}.png")
+            logging.info("Attempted navigation with URL-based date parameters.")
+        except Exception as e_url_nav:
+            logging.warning(f"URL-based date navigation failed: {e_url_nav}. Falling back to UI interaction.")
+            if test_mode:
+                 await page.screenshot(path=f"debug_date_url_nav_failed_{location_query}.png")
+            # Ensure page is back at a known state if goto failed partway or timed out
+            await page.goto(current_url_after_location, wait_until='networkidle', timeout=10000) 
+            # Fallback to UI datepicker if URL method fails or is not applicable
+            await initial_search_ui_datepicker(page, date_from_str, date_to_str, location_query, test_mode)
+    else: 
+        # Fallback to UI datepicker if formatted dates are not available (e.g. empty date strings in profile)
+        logging.info("Formatted dates not available for URL parameters. Proceeding with UI-based date selection.")
+        await initial_search_ui_datepicker(page, date_from_str, date_to_str, location_query, test_mode)
+
+    # Final check: Ensure page has loaded with either results or a no-results message.
+    # This is crucial for both URL parameter and UI date selection paths.
+    try:
+        for _ in range(10): 
+            has_results = await page.locator('div[data-testid="searchresults_grid_item"]').count() > 0
+            has_no_results = await page.locator('text=waiting on house and pet sitting opportunities').count() > 0
+            if has_results or has_no_results:
+                logging.info(
+                    f"Page loaded for {location_query} - Results: {has_results}, No results message: {has_no_results}")
+                break
+            await asyncio.sleep(1) 
+        else: # If loop completes without break
+            logging.error(f"Timed out waiting for page to load search results or 'no results' message: {location_query}")
+            await page.screenshot(path=f"error_page_load_final_check_{location_query}.png") # Error screenshot
+            raise Exception("Page failed to load search results or no results message after all date setting attempts.")
+    except Exception as e:
+        logging.error(f"Exception while checking for page load after date setting: {e}")
+        await page.screenshot(path=f"error_page_load_exception_{location_query}.png") # Error screenshot
+        raise # Re-raise the exception to be caught by process_profile
+
+async def initial_search_ui_datepicker(page, date_from_str, date_to_str, location_query, test_mode=False):
+    """
+    Handles the UI interactions for date selection using the datepicker.
+    This function is called as a fallback if URL-based date setting fails or is not applicable.
+    It includes optimized "calculated clicks" logic for month navigation and robust fallbacks.
+    """
+    logging.info(f"Profile {location_query}: Using UI datepicker for date selection.")
     await page.get_by_role('button', name='Dates').click()
     await wait_like_human()
 
-    # Extract month and year from the dates
-    date_from = profile_config["search"]["date_from"]  # e.g., "01 Nov 2025"
-    date_to = profile_config["search"]["date_to"]  # e.g., "24 Dec 2025"
+    target_from_date = datetime.strptime(date_from_str, "%d %b %Y")
+    target_to_date = datetime.strptime(date_to_str, "%d %b %Y")
 
-    # Parse the dates
-    from_parts = date_from.split(" ")
-    from_day = from_parts[0]
-    from_month = from_parts[1]
-    from_year = from_parts[2]
-
-    to_parts = date_to.split(" ")
-    to_day = to_parts[0]
-    to_month = to_parts[1]
-    to_year = to_parts[2]
-
-    # Navigate to the correct month - try for up to 10 clicks
-    found_month = False
-    for _ in range(10):
-        # Take a screenshot to see what we're looking at
-        await page.screenshot(path=f"calendar_navigation_{_}.png")
-
-        # Check for month in different formats - both full month name and abbreviated
-        # For example "November 2025" and "Nov 2025"
-        if await page.locator(f'text={from_month} {from_year}').is_visible() or \
-                await page.locator(f'text={from_month.capitalize()} {from_year}').is_visible() or \
-                await page.locator(f'text=November {from_year}').is_visible():
-            found_month = True
-            logging.info(f"Found target month after {_} clicks")
-            break
-
-        await page.get_by_role('button', name='chevron-right').click()
-        await wait_like_human()
-
-    if not found_month:
-        logging.error(f"Could not find target month: {from_month} {from_year}")
-        raise Exception(f"Month navigation failed")
-
-    # Try different formats for date selection
-    try:
-        # First try original format
-        await page.get_by_label(f'{from_day} {from_month} {from_year}').click()
-    except Exception:
+    async def navigate_and_select_date(target_date: datetime, date_label_prefix: str):
+        # Get current displayed month and year from the calendar for "calculated clicks" optimization.
+        current_month_year_str = "" 
         try:
-            # Try with leading zero
-            await page.get_by_label(f'{int(from_day):02d} {from_month} {from_year}').click()
+            # Attempt to find the current month/year displayed in the datepicker.
+            # This is used to calculate the exact number of clicks needed to reach the target month.
+            possible_selectors = [
+                '.react-datepicker__current-month', '[class*="CurrentMonth"]', 
+                '.DayPicker-Caption', '.rdp-caption_label' 
+            ]
+            for selector_idx, sel in enumerate(possible_selectors):
+                if await page.locator(sel).count() > 0:
+                    current_month_year_str = await page.locator(sel).first.text_content(timeout=2000)
+                    logging.info(f"Found current month display with selector '{sel}': {current_month_year_str}")
+                    break
+                else:
+                    logging.debug(f"Selector '{sel}' not found for current month display (attempt {selector_idx+1}).")
+            
+            if not current_month_year_str: 
+                # Conditional screenshot: If current month detection fails for calculated clicks.
+                if test_mode: 
+                    await page.screenshot(path=f"debug_calendar_month_detection_failed_{date_label_prefix}_{location_query}.png")
+                logging.warning("Could not determine current displayed month. Falling back to iterative month navigation.")
+                # Fallback: Iterative clicking if current month cannot be determined.
+                found_month_fallback = False
+                for _ in range(12): # Max 12 clicks to find the month
+                    # ... (iterative clicking logic as before) ...
+                    month_name_full = target_date.strftime("%B")
+                    month_name_abbr = target_date.strftime("%b")
+                    year_full = str(target_date.year)
+                    if (await page.locator(f'text={month_name_abbr} {year_full}').is_visible() or
+                        await page.locator(f'text={month_name_full} {year_full}').is_visible()):
+                        found_month_fallback = True
+                        # Conditional screenshot: Month found during iterative fallback.
+                        if test_mode: 
+                            await page.screenshot(path=f"debug_calendar_fallback_month_found_{date_label_prefix}_{location_query}.png")
+                        break
+                    await page.get_by_role('button', name='chevron-right').click()
+                    await wait_like_human(0.1, 0.2)
+                if not found_month_fallback:
+                    raise Exception(f"Iterative fallback month navigation failed for {date_label_prefix} date.")
+            else: 
+                # Optimized "calculated clicks" for month navigation.
+                # Parses the displayed month/year to determine current calendar position.
+                current_date_on_calendar = datetime.strptime(current_month_year_str.replace(",", ""), "%B %Y") 
+                # Calculates month difference to target.
+                month_diff = (target_date.year - current_date_on_calendar.year) * 12 + (target_date.month - current_date_on_calendar.month)
+                nav_button_name = 'chevron-right' if month_diff > 0 else 'chevron-left'
+                clicks_needed = abs(month_diff)
+
+                logging.info(f"For {date_label_prefix} date ({target_date.strftime('%b %Y')}): Current calendar month {current_date_on_calendar.strftime('%b %Y')}, clicks needed: {clicks_needed} ({nav_button_name})")
+                for i in range(clicks_needed):
+                    await page.get_by_role('button', name=nav_button_name).click()
+                    await wait_like_human(0.1, 0.2) 
+                    # Conditional screenshot: After each navigation click in calculated mode.
+                    if test_mode: 
+                        await page.screenshot(path=f"debug_calendar_nav_click_{date_label_prefix}_{i+1}_{location_query}.png")
+                    logging.debug(f"Navigation click {i+1} for {date_label_prefix} date.")
+        
+        except Exception as e:
+            # Conditional screenshot: If calculated navigation logic itself errors out.
+            if test_mode: 
+                await page.screenshot(path=f"debug_calendar_calc_nav_error_fallback_start_{date_label_prefix}_{location_query}.png")
+            logging.error(f"Error in calculated/new month navigation for {date_label_prefix} date: {e}. Attempting simpler fallback.")
+            # Fallback to simpler iterative clicking if any part of advanced navigation fails.
+            found_month_fallback = False
+            for _ in range(12): 
+                # ... (iterative clicking logic as before) ...
+                month_name_full = target_date.strftime("%B") 
+                month_name_abbr = target_date.strftime("%b") 
+                year_full = str(target_date.year)
+                if (await page.locator(f'text={month_name_abbr} {year_full}').is_visible() or
+                    await page.locator(f'text={month_name_full} {year_full}').is_visible()):
+                    found_month_fallback = True
+                    # Conditional screenshot: Month found during the error's iterative fallback.
+                    if test_mode: 
+                         await page.screenshot(path=f"debug_calendar_error_fallback_month_found_{date_label_prefix}_{location_query}.png")
+                    logging.info(f"Error fallback month navigation successful for {date_label_prefix} date.")
+                    break
+                await page.get_by_role('button', name='chevron-right').click() 
+                await wait_like_human(0.1, 0.2)
+            if not found_month_fallback:
+                logging.error(f"Error fallback month navigation failed for {date_label_prefix} date: {target_date.strftime('%b %Y')}")
+                raise Exception(f"Month navigation completely failed for {date_label_prefix} date.")
+
+        # Select the day
+        day_str = str(target_date.day)
+        month_str_abbr = target_date.strftime("%b")
+        year_str = str(target_date.year)
+        day_selector_specific = f'.react-datepicker__day:not(.react-datepicker__day--outside-month):text-matches("^{int(day_str)}$")'
+        try:
+            await page.get_by_label(f'{day_str} {month_str_abbr} {year_str}', exact=False).click(timeout=3000)
         except Exception:
             try:
-                # Try with day of week
-                for day_name in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]:
-                    try:
-                        await page.get_by_label(f'{from_day} {from_month} {from_year} {day_name}').click()
-                        break
-                    except:
-                        continue
+                await page.get_by_label(f'{int(day_str):02d} {month_str_abbr} {year_str}', exact=False).click(timeout=3000)
             except Exception:
-                # Last resort - find and click the day number in the current month view
-                await page.locator(
-                    f'.react-datepicker__day:not(.react-datepicker__day--outside-month):text("{from_day}")').first.click()
-
-    await wait_like_human()
-
-    # Navigate to end date month if needed
-    if from_month != to_month or from_year != to_year:
-        await page.get_by_role('button', name='chevron-right').click()
+                logging.info(f"get_by_label failed for {date_label_prefix} day {day_str}, trying specific CSS selector.")
+                await page.locator(day_selector_specific).first.click() 
         await wait_like_human()
 
-    # Select end date with similar fallback options
-    try:
-        await page.get_by_label(f'{to_day} {to_month} {to_year}').click()
-    except Exception:
-        try:
-            await page.get_by_label(f'{int(to_day):02d} {to_month} {to_year}').click()
-        except Exception:
-            try:
-                # Try with day of week
-                for day_name in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]:
-                    try:
-                        await page.get_by_label(f'{to_day} {to_month} {to_year} {day_name}').click()
-                        break
-                    except:
-                        continue
-            except Exception:
-                # Last resort - find and click the day number
-                await page.locator(
-                    f'.react-datepicker__day:not(.react-datepicker__day--outside-month):text("{to_day}")').first.click()
+    await navigate_and_select_date(target_from_date, "from")
+    await navigate_and_select_date(target_to_date, "to")
 
-    await wait_like_human()
-
-    # Apply dates
     await page.get_by_role('button', name='Apply').click()
     await wait_like_human(1, 2)
-
-    # Check if page has loaded with either results or no results message
-    try:
-        # Wait for either search results OR the no results message
-        for _ in range(10):  # Try for a reasonable amount of time
-            has_results = await page.locator('div[data-testid="searchresults_grid_item"]').count() > 0
-            has_no_results = await page.locator('text=waiting on house and pet sitting opportunities').count() > 0
-
-            if has_results or has_no_results:
-                logging.info(
-                    f"Page loaded for {profile_config['search']['location']} - Results: {has_results}, No results message: {has_no_results}")
-                break
-
-            await asyncio.sleep(1)  # Wait a second between checks
-        else:
-            # This executes if the loop completes without breaking
-            logging.error(f"Timed out waiting for page to load: {profile_config['search']['location']}")
-            await page.screenshot(path=f"error_page_load_{profile_config['search']['location']}.png")
-            raise Exception("Page failed to load search results or no results message")
-
-    except Exception as e:
-        logging.error(f"Page failed to load search results: {e}")
-        await page.screenshot(path=f"error_page_load_{profile_config['search']['location']}.png")
-        raise
-
-
-async def apply_filters(page, mode) -> None:
-    if mode is None: return
-
-    # Check if we have no results
-    no_results = await page.locator("text=We're waiting on house and pet sitting opportunities").count() > 0
-    if no_results:
-        logging.info(f"No results available, skipping filter: {mode}")
-        return
-
-    logging.info(f"Applying filter: {mode}")
-
-    try:
-        # Click More Filters button
-        more_filters = page.get_by_role("button", name="More Filters")
-        await more_filters.wait_for(state="visible", timeout=10000)
-        await more_filters.click()
-        await wait_like_human()
-
-        # Select the appropriate filter
-        lbl_text = "Accessible by public transport" if mode == 'public_transport' else "Use of car included"
-
-        # Look for the label text and click the associated checkbox
-        filter_labels = await page.locator("label").filter(has_text=lbl_text).all()
-        if filter_labels:
-            # Click the checkbox (span inside the label)
-            await filter_labels[0].locator('span').nth(2).click()
-            await wait_like_human()
-        else:
-            logging.error(f"Filter option '{lbl_text}' not found")
-            await page.screenshot(path=f"error_filter_not_found_{mode}.png")
-            raise Exception(f"Filter option '{lbl_text}' not found")
-
-        # Click Apply button
-        apply_button = page.get_by_role("button", name="Apply")
-        await apply_button.wait_for(state="visible", timeout=5000)
-        await apply_button.click()
-        await wait_like_human()
-
-        # Wait for results or no results message using the same approach as in initial_search
-        for _ in range(10):  # Try for a reasonable amount of time
-            has_results = await page.locator('div[data-testid="searchresults_grid_item"]').count() > 0
-            has_no_results = await page.locator('text=waiting on house and pet sitting opportunities').count() > 0
-
-            if has_results or has_no_results:
-                logging.info(f"Filter applied: {mode} - Results: {has_results}, No results message: {has_no_results}")
-                break
-
-            await asyncio.sleep(1)  # Wait a second between checks
-        else:
-            # This executes if the loop completes without breaking
-            logging.error(f"Timed out waiting for page to load after applying filter: {mode}")
-            await page.screenshot(path=f"error_filter_applied_{mode}.png")
-            raise Exception("Page failed to load search results or no results message after applying filter")
-
-    except Exception as e:
-        logging.error(f"Error applying filter '{mode}': {e}")
-        await page.screenshot(path=f"error_applying_filter_{mode}.png")
-        raise
 
 
 async def scrape_run(page, test_mode=False) -> list[dict]:
     rows = []
     page_num = 1
 
-    # First check if we have no results
     no_results = await page.locator("text=We're waiting on house and pet sitting opportunities").count() > 0
     if no_results:
         logging.info("No search results available for this search")
-        return rows  # Return empty list
+        return rows 
 
     try:
         while True:
             logging.info(f"Scraping page {page_num}")
-
-            # Wait for search results to load
             await page.wait_for_selector('div[data-testid="searchresults_grid_item"]', timeout=15000)
-            await page.screenshot(path=f"debug_results_page_{page_num}.png")
+            # Conditional screenshot: Captures each page of results if in test_mode.
+            if test_mode:
+                await page.screenshot(path=f"debug_results_page_{page_num}.png")
 
-            # Get all listing cards
             cards = await page.locator('div[data-testid="searchresults_grid_item"]').all()
             logging.info(f"Found {len(cards)} cards on page {page_num}")
-
             if not cards: break
 
-            # Process each card
             for card_idx, card in enumerate(cards if not test_mode else cards[:2]):
                 try:
                     title = await card.locator('h3[data-testid="ListingCard__title"]').text_content(timeout=1000)
                     loc = await card.locator('span[data-testid="ListingCard__location"]').text_content(timeout=1000)
                     town, country = split_location(loc)
 
-                    # Get date range
-                    date_elements = await card.locator("div[class*='UnOOR'] > span").all()
-                    if date_elements:
-                        raw = await date_elements[0].text_content(timeout=1000)
-                        d1, d2 = (re.split(r"\s*[-–]\s*", raw.replace('+', '').strip()) + ['', ''])[:2]
-                    else:
-                        d1, d2 = '', ''
+                    # Get date range - Uses a regex to find a span matching common date range patterns.
+                    # This is more resilient to changes in surrounding class names or DOM structure.
+                    date_text_pattern = re.compile(r"(\w{3}\s\d{1,2}(?:,\s\d{4})?\s*[-–→]\s*\w{3}\s\d{1,2}(?:,\s\d{4})?|\d{1,2}\s\w{3}(?:,\s\d{4})?\s*[-–→]\s*\d{1,2}\s\w{3}(?:,\s\d{4})?)")
+                    date_locator = card.locator('span').filter(has_text=date_text_pattern).first
+                    d1, d2 = '', ''
+                    try:
+                        if await date_locator.count() > 0:
+                            raw_date_text = await date_locator.text_content(timeout=1000)
+                            if raw_date_text:
+                                d1, d2 = (re.split(r"\s*[-–]\s*", raw_date_text.replace('+', '').strip()) + ['', ''])[:2]
+                        else:
+                            logging.debug("Date range span not found with regex pattern for a card.")
+                    except Exception as e_date:
+                        logging.warning(f"Could not extract date for card: {e_date}")
 
-                    # Check if the listing is reviewing applications
                     reviewing = await card.locator('span[data-testid="ListingCard__review__label"]').count() > 0
 
-                    # Get the listing URL
-                    rel = await card.locator('a').get_attribute('href', timeout=1000)
+                    # Get the listing URL - Tries a sequence of common robust patterns for the main link.
+                    # 1. Specific data-testid="listing-card-link" (speculative ideal).
+                    # 2. Link wrapping the H3 title.
+                    # 3. First direct anchor child of the card container.
+                    # Falls back to the first available link if specific patterns fail.
+                    url_loc = card.locator('a[data-testid="listing-card-link"]') \
+                                 .or_(card.locator('a:has(h3[data-testid="ListingCard__title"])')) \
+                                 .or_(card.locator('div[data-testid="searchresults_grid_item"] > a')) \
+                                 .first
+                    rel = ""
+                    if await url_loc.count() > 0:
+                         rel = await url_loc.get_attribute('href', timeout=1000)
+                    else:
+                        logging.warning("Primary URL locators failed, falling back to 'card.locator(\"a\").first'")
+                        if await card.locator('a').count() > 0:
+                           rel = await card.locator('a').first.get_attribute('href', timeout=1000)
+                        else:
+                            logging.error("Could not find any link for a card to extract URL.")
+                            rel = "#error-no-url-found" # Placeholder for missing URL
 
-                    # Extract pet information
-                    pets = await extract_pets(card)
+                    pets = await extract_pets(card) # Optimized pet extraction
 
-                    # Add the listing to our results
+                    # Attempt to extract transport and car information from card details.
+                    # These selectors are speculative and rely on common text patterns or potential data-testids.
+                    public_transport_available = False
+                    try:
+                        pt_indicator_texts = ["Accessible by public transport", "Public transport nearby"]
+                        pt_found = False
+                        for text_indicator in pt_indicator_texts:
+                            if await card.locator(f"text={text_indicator}").count() > 0:
+                                pt_found = True
+                                break
+                        if not pt_found and await card.locator('[data-testid*="public-transport"]').count() > 0:
+                            pt_found = True
+                        public_transport_available = pt_found
+                    except Exception as e_pt:
+                        logging.debug(f"Could not determine public transport for card {card_idx} on page {page_num}: {e_pt}")
+
+                    car_is_included = False
+                    try:
+                        ci_indicator_texts = ["Use of car included", "Car available"]
+                        ci_found = False
+                        for text_indicator in ci_indicator_texts:
+                            if await card.locator(f"text={text_indicator}").count() > 0:
+                                ci_found = True
+                                break
+                        if not ci_found and await card.locator('[data-testid*="car-included"]').count() > 0:
+                            ci_found = True
+                        car_is_included = ci_found
+                    except Exception as e_car:
+                        logging.debug(f"Could not determine car inclusion for card {card_idx} on page {page_num}: {e_car}")
+
+                    # Append all extracted data for the current listing.
                     rows.append({
                         'url': f"https://www.trustedhousesitters.com{rel}",
                         'listing_id': listing_id_from_url(rel),
-                        'date_range': f"{d1}→{d2}",
-                        'title': title.strip(),
-                        'location': loc.strip(),
-                        'town': town,
-                        'country': country,
-                        'date_from': d1,
-                        'date_to': d2,
-                        'reviewing': reviewing,
-                        **pets
+                        'date_range': f"{d1}→{d2}", 'title': title.strip(), 'location': loc.strip(),
+                        'town': town, 'country': country, 'date_from': d1, 'date_to': d2,
+                        'reviewing': reviewing, 'public_transport_available': public_transport_available,
+                        'car_is_included': car_is_included, **pets
                     })
                 except Exception as e:
                     logging.exception(f"Error parsing card {card_idx} on page {page_num}: {e}")
 
-            # Check if there's a next page - first check if the next button exists
+            # Pagination: Check for and navigate to the next page.
             try:
                 next_link = page.get_by_role('link', name='Go to next page')
-                next_link_count = await next_link.count()
-
-                # If there's no next page link at all, we're done
-                if next_link_count == 0:
-                    logging.info("No next page link found - this must be the last page")
+                if await next_link.count() == 0 or await next_link.get_attribute('aria-disabled') == 'true':
+                    logging.info("Next page link not found or disabled - this is the last page.")
                     break
-
-                # If there is a next link, check if it's disabled
-                is_disabled = await next_link.get_attribute('aria-disabled', timeout=5000)
-
-                if is_disabled == 'true':
-                    logging.info("Next page link is disabled - this is the last page")
-                    break
-
-                # Otherwise, click the next page button and continue
                 await next_link.click()
                 await wait_like_human()
                 page_num += 1
-
             except Exception as e:
-                # This could happen if we only have one page of results
-                logging.info(f"No more pages or error navigating: {e}")
+                logging.info(f"No more pages or error navigating to next page: {e}")
                 break
-
     except Exception as e:
         logging.error(f"Error in scrape_run: {e}")
-        await page.screenshot(path=f"error_scrape_run.png")
-
+        await page.screenshot(path=f"error_scrape_run.png") # Error screenshot
     return rows
 
 
 def apply_profile_filters(df, profile_config):
     """Apply profile-specific filters to the dataframe"""
     filtered_df = df.copy()
-
-    # Apply excluded countries filter
     excluded_countries = profile_config.get("filters", {}).get("excluded_countries", [])
     if excluded_countries:
         filtered_df = filtered_df[~filtered_df['country'].isin(excluded_countries)]
-
-    # Apply max pets filter
     max_pets = profile_config.get("filters", {}).get("max_pets", {})
     for pet_type, max_count in max_pets.items():
-        if pet_type in PET_TYPES:
+        if pet_type in PET_TYPES: # Ensure filtering only by recognized pet types
             filtered_df = filtered_df[filtered_df[pet_type] <= max_count]
-
     return filtered_df
 
 
 async def process_profile(profile_name, profile_config, test_mode=False):
+    # This function now performs a single search and scrape pass per profile.
+    # It attempts to extract all necessary information, including transport and car details,
+    # directly from the listing cards found in the initial search results.
+    # This avoids multiple filter applications and page reloads for the same base search.
     logging.info(f"Processing profile: {profile_name}")
-    start_time = time.time()
+    overall_profile_processing_start_time = time.time() 
+    all_listings_data = []
 
     async with async_playwright() as p:
+        # Timing for browser launch and context setup
+        pt_browser_launch_start = time.time()
         browser = await p.chromium.launch(headless=HEADLESS)
         ctx = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -506,71 +582,88 @@ async def process_profile(profile_name, profile_config, test_mode=False):
             locale='en-US'
         )
         await ctx.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        logging.info(f"Profile {profile_name}: Browser launch & context creation took {time.time() - pt_browser_launch_start:.2f}s")
+        
+        page = await ctx.new_page()
 
-        async def run_mode(mode):
-            page = await ctx.new_page()
-            try:
-                await initial_search(page, profile_config)
-                no_results = await page.locator("text=We're waiting on house and pet sitting opportunities").count() > 0
-                if no_results:
-                    logging.info(f"No results available for profile {profile_name}, mode {mode}")
-                    return mode, []
-                await apply_filters(page, mode)
-                results = await scrape_run(page, test_mode)
-                logging.info(f"Found {len(results)} results for {profile_name}, mode {mode}")
-                return mode, results
-            except Exception as e:
-                logging.critical(f"Mode {mode} failed for profile {profile_name}: {e}", exc_info=True)
-                html = await page.content()
-                with open(f"crash_dump_{profile_name}_{mode}.html", "w") as f:
-                    f.write(html)
-                await page.screenshot(path=f"crash_screenshot_{profile_name}_{mode}.png", full_page=True)
-                return mode, []
+        try:
+            # Timing for initial search (location and date setting)
+            pt_initial_search_start = time.time()
+            await initial_search(page, profile_config, test_mode=test_mode) 
+            logging.info(f"Profile {profile_name}: initial_search took {time.time() - pt_initial_search_start:.2f}s")
+            
+            no_results = await page.locator("text=We're waiting on house and pet sitting opportunities").count() > 0
+            if no_results:
+                logging.info(f"No results available for profile {profile_name} after initial search.")
+                if browser.is_connected():
+                    await browser.close()
+                return pd.DataFrame()
 
-        results = await asyncio.gather(*(run_mode(mode) for mode in MODES))
-        await browser.close()
+            # Timing for scraping all listing data from results pages
+            pt_scrape_run_start = time.time()
+            all_listings_data = await scrape_run(page, test_mode)
+            logging.info(f"Profile {profile_name}: scrape_run (scraped {len(all_listings_data)} raw results) took {time.time() - pt_scrape_run_start:.2f}s")
 
-    runs = dict(results)
+        except Exception as e:
+            logging.critical(f"Scraping failed for profile {profile_name}: {e}", exc_info=True)
+            html_content = await page.content() 
+            with open(f"crash_dump_{profile_name}.html", "w") as f:
+                f.write(html_content)
+            await page.screenshot(path=f"crash_screenshot_{profile_name}.png", full_page=True) # Error screenshot
+            if browser.is_connected():
+                 await browser.close()
+            return pd.DataFrame() 
+        finally:
+            if browser.is_connected(): 
+                 await browser.close()
 
-    base_df = pd.DataFrame(runs.get(None, []))
-    if base_df.empty:
-        logging.warning(f"No results found for profile {profile_name}")
+    # Timing for DataFrame creation and initial processing after scraping
+    pt_df_creation_start = time.time()
+    if not all_listings_data:
+        logging.warning(f"No listings data retrieved for profile {profile_name}")
         return pd.DataFrame()
 
-    now = datetime.utcnow().isoformat() + 'Z'
-    public_transport_ids = [listing_id_from_url(r['url']) for r in runs.get('public_transport', [])]
-    car_included_ids = [listing_id_from_url(r['url']) for r in runs.get('car_included', [])]
+    base_df = pd.DataFrame(all_listings_data)
+    if base_df.empty:
+        logging.info(f"DataFrame is empty for {profile_name} after processing listings.")
+        return base_df
 
-    for idx, row in base_df.iterrows():
-        listing_id = row['listing_id']
-        pt_match = listing_id in public_transport_ids
-        car_match = listing_id in car_included_ids
-        logging.info(f"Listing {listing_id} - Public transport: {pt_match}, Car included: {car_match}")
-
-    base_df['public_transport'] = base_df['listing_id'].isin(public_transport_ids).astype(bool)
-    base_df['car_included'] = base_df['listing_id'].isin(car_included_ids).astype(bool)
+    base_df['public_transport'] = base_df.get('public_transport_available', pd.Series(dtype=bool)).astype(bool)
+    base_df['car_included'] = base_df.get('car_is_included', pd.Series(dtype=bool)).astype(bool)
     base_df['unique_key'] = base_df['listing_id'] + '|' + base_df['date_range']
     base_df['profile'] = profile_name
+    
+    # This loop can be verbose, consider removing or making conditional if too noisy for production.
+    # For now, it's kept for detailed verification of the extracted boolean flags.
+    # for idx, row in base_df.iterrows():
+    #     logging.info(f"Listing {row['listing_id']} - Public transport: {row['public_transport']}, Car included: {row['car_included']}")
+    logging.info(f"Profile {profile_name}: DataFrame creation and initial processing took {time.time() - pt_df_creation_start:.2f}s")
 
-    logging.info(f"Profile {profile_name} completed in {time.time() - start_time:.2f}s, found {len(base_df)} listings")
+    logging.info(f"Profile {profile_name} completed in {time.time() - overall_profile_processing_start_time:.2f}s, processed {len(base_df)} listings")
     return base_df
 
-# --- Modify main to run profiles in parallel (unchanged if already done) ---
+# --- Main execution block ---
 async def main(test_mode=False) -> None:
     logging.info("Starting scrape")
-    start_time = time.time()
+    overall_main_start_time = time.time() 
 
+    # Timing for loading profile configurations
+    mt_load_profiles_start = time.time()
     profiles = load_profiles()
-    logging.info(f"Loaded {len(profiles)} search profiles")
+    logging.info(f"Loaded {len(profiles)} search profiles in {time.time() - mt_load_profiles_start:.2f}s")
 
-    async def run_profile(name, config):
+    # Inner function to wrap process_profile for asyncio.gather, does not need separate timing here.
+    async def run_profile(name, config): 
         try:
             return name, await process_profile(name, config, test_mode)
         except Exception as e:
             logging.error(f"Failed to process profile {name}: {e}", exc_info=True)
             return name, e
 
+    # Timing for processing all profiles concurrently
+    mt_gather_profiles_start = time.time()
     results = await asyncio.gather(*(run_profile(name, config) for name, config in profiles.items()))
+    logging.info(f"All profiles processed (asyncio.gather) in {time.time() - mt_gather_profiles_start:.2f}s")
 
     all_results = []
     for name, result in results:
@@ -585,59 +678,82 @@ async def main(test_mode=False) -> None:
 
     base_df = pd.concat(all_results, ignore_index=True)
 
+    # Timing for loading old data from JSON
     if os.path.exists(JSON_PATH) and os.path.getsize(JSON_PATH) > 0:
         try:
+            mt_load_old_df_start = time.time()
             old_df = pd.read_json(JSON_PATH)
+            logging.info(f"Loaded old_df from {JSON_PATH} in {time.time() - mt_load_old_df_start:.2f}s")
         except Exception as e:
             logging.warning(f"Bad JSON, reset: {e}")
             old_df = pd.DataFrame()
     else:
         old_df = pd.DataFrame()
 
-    old_df['public_transport'] = old_df.get('public_transport', False).fillna(False).astype(bool)
-    old_df['car_included'] = old_df.get('car_included', False).fillna(False).astype(bool)
+    # Ensure essential columns exist in old_df with correct dtypes before merging
+    old_df['public_transport'] = old_df.get('public_transport', pd.Series(dtype=bool)).fillna(False).astype(bool)
+    old_df['car_included'] = old_df.get('car_included', pd.Series(dtype=bool)).fillna(False).astype(bool)
     default_fs = (datetime.utcnow() - timedelta(seconds=1)).isoformat() + 'Z'
     old_df['first_seen'] = old_df.get('first_seen', default_fs)
     old_df['last_changed'] = old_df.get('last_changed', old_df['first_seen'])
 
-    if 'unique_key' not in old_df:
-        old_df['unique_key'] = old_df.apply(
-            lambda r: listing_id_from_url(r['url']) + '|' + f"{r['date_from']}→{r['date_to']}", axis=1
-        )
+    if 'unique_key' not in old_df.columns and not old_df.empty:
+         old_df['unique_key'] = old_df.apply(
+             lambda r: listing_id_from_url(r.get('url', '')) + '|' + f"{r.get('date_from', '')}→{r.get('date_to', '')}", axis=1
+         )
+    elif old_df.empty: # Ensure 'unique_key' column exists even if old_df is empty for consistent merging
+        old_df['unique_key'] = pd.Series(dtype=str)
 
+    # Timing for merging old and new data
+    mt_merge_data_start = time.time()
     merged = old_df.set_index('unique_key').combine_first(base_df.set_index('unique_key'))
+    logging.info(f"Merged old and new data in {time.time() - mt_merge_data_start:.2f}s")
 
+    # Timing for final DataFrame processing (updates, new/expired flags)
+    mt_final_df_processing_start = time.time()
     now = datetime.utcnow().isoformat() + 'Z'
     for uk, row in merged.iterrows():
-        if uk in base_df['unique_key'].values:
-            nr = base_df.loc[base_df['unique_key'] == uk].iloc[0]
-            orow = old_df.loc[old_df['unique_key'] == uk].iloc[0] if uk in old_df['unique_key'].values else None
-            changed = orow is None or any(
-                nr[col] != orow[col] for col in CONTENT_COLS + ['public_transport', 'car_included']
-            )
-            merged.at[uk, 'last_changed'] = now if changed else row['last_changed']
-            merged.at[uk, 'profile'] = nr['profile']
+        if uk in base_df['unique_key'].values: # Process only rows that were in the latest scrape
+            nr = base_df.loc[base_df['unique_key'] == uk].iloc[0] # New row from current scrape
+            orow_series_list = old_df.loc[old_df['unique_key'] == uk] if uk in old_df['unique_key'].values else []
+            
+            changed = True # Assume changed if it's a new row
+            if len(orow_series_list) > 0: # If it existed in old data
+                orow = orow_series_list.iloc[0]
+                # Check for changes only if it's not a new row and columns exist in both
+                changed = any(nr[col] != orow[col] for col in CONTENT_COLS + ['public_transport', 'car_included'] if col in orow and col in nr)
+            
+            merged.at[uk, 'last_changed'] = now if changed else row.get('last_changed', now) # Use existing if no change
+            merged.at[uk, 'profile'] = nr['profile'] # Update profile from current scrape
 
     merged['first_seen'] = merged['first_seen'].fillna(now)
     df = merged.reset_index()
     df['new_this_run'] = df['first_seen'] == now
 
-    old_keys = set(old_df['unique_key'])
-    new_keys = set(df['unique_key'])
+    # Expired data handling: identify listings no longer present in the scrape
+    old_keys = set(old_df['unique_key'].dropna()) 
+    new_keys = set(df['unique_key'].dropna())
     exp_keys = old_keys - new_keys
     exp_df = old_df[old_df['unique_key'].isin(exp_keys)].copy()
-    exp_df['expired'] = True
-    exp_df['new_this_run'] = False
-    df['expired'] = False
+    if not exp_df.empty:
+        exp_df['expired'] = True
+        exp_df['new_this_run'] = False
+    else: # Ensure columns exist even if exp_df is empty, for robust concat
+        exp_df = pd.DataFrame(columns=df.columns.tolist() + ['expired'])
 
+    df['expired'] = False
     out_df = pd.concat([df, exp_df], ignore_index=True)
+    logging.info(f"Final DataFrame processing took {time.time() - mt_final_df_processing_start:.2f}s")
 
     out_df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_NONNUMERIC)
     out_df.to_json(JSON_PATH, orient='records', indent=2)
     logging.info(f"Saved {len(out_df)} records")
 
+    # Timing for sending all Telegram notifications
+    mt_telegram_total_start = time.time()
     for profile_name, profile_config in profiles.items():
-        profile_df = out_df[(out_df['new_this_run']) & (out_df['profile'] == profile_name)]
+        # Filter for new, non-expired listings for the current profile before applying further filters
+        profile_df = out_df[(out_df['new_this_run']) & (out_df['profile'] == profile_name) & (out_df['expired'] == False)] 
         profile_df = apply_profile_filters(profile_df, profile_config)
 
         if profile_df.empty:
@@ -645,8 +761,9 @@ async def main(test_mode=False) -> None:
         else:
             logging.info(f"Sending {len(profile_df)} alerts for profile {profile_name}")
             send_telegram_message(format_telegram_message(profile_df.to_dict('records'), profile_config))
-
-    logging.info(f"Done in {time.time() - start_time:.2f}s")
+    logging.info(f"Total time for sending all Telegram notifications took {time.time() - mt_telegram_total_start:.2f}s")
+    
+    logging.info(f"Done in {time.time() - overall_main_start_time:.2f}s")
 
 if __name__ == '__main__':
     try:
