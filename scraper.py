@@ -120,7 +120,9 @@ async def extract_pets(card) -> dict:
 
 
 def listing_id_from_url(url: str) -> str:
-    m = re.search(r'/l/(\d+)(?:/|$)', url)
+    # Modified regex to correctly capture ID even with query parameters.
+    # Old regex: r'/l/(\d+)(?:/|$)'
+    m = re.search(r'/l/(\d+)', url) 
     return m.group(1) if m else url
 
 def format_date_for_url(date_str: str) -> str:
