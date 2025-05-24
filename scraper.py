@@ -68,9 +68,13 @@ async def extract_pets(card) -> dict:
     # minimizing back-and-forth communication between Playwright and the browser.
     js_script = """
     ulElement => {
+        // Guard clause: Check if ulElement is a valid DOM element with querySelectorAll
+        if (!ulElement || typeof ulElement.querySelectorAll !== 'function') {
+            // console.warn('ulElement is not a valid DOM element or querySelectorAll is not a function.'); // Optional: for browser-side debugging
+            return []; // Return empty array if not valid
+        }
+
         const petData = [];
-        if (!ulElement) return petData; // Should not happen if locator finds the ul
-        
         const items = ulElement.querySelectorAll('li');
         items.forEach(item => {
             try {
@@ -111,10 +115,11 @@ async def extract_pets(card) -> dict:
                 continue
                 
     except Exception as e:
-        # This catches errors from evaluate_all or if the locator itself fails initially
-        logging.error(f"Error in extract_pets with evaluate_all: {e}")
-        # Fallback or re-throw: For now, returning empty counts on major error
-        return {p: 0 for p in PET_TYPES} # Return fresh empty counts
+        # This is the main exception handler for the evaluate_all call or its result processing
+        logging.error(f"Error during extract_pets (evaluate_all or its processing): {e}. Returning zero pets for this listing.")
+        # Ensure counts is the default all-zero dictionary for safety.
+        counts = {p: 0 for p in PET_TYPES} 
+        return counts # Return the zeroed counts
         
     return counts
 
