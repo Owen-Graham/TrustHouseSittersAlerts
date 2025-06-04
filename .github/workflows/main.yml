@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '*/55 * * * *'  # Every 55 minutes
+    - cron: '0 0-16 * * *'  # Hourly from 8am to midnight Perth time (UTC+8)
   workflow_dispatch:
 
 permissions:
