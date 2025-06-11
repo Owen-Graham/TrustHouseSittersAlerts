@@ -2,37 +2,52 @@
   "europe": {
     "search": {
       "location": "europe",
-      "date_from": "01 Nov 2025",
+      "date_from": "11 Dec 2025",
       "date_to": "24 Dec 2025"
     },
     "filters": {
       "excluded_countries": ["United Kingdom", "Ireland"],
       "max_pets": {
-        "dog": 2,
-        "cat": 3
       }
     },
     "notification": {
-      "header": "🏰 EUROPE SITS 🏰",
+      "header": "🏰 EUROPE SITS AFTER GERMANY 🏰",
       "icon": "🇪🇺"
     }
   },
   "asia": {
     "search": {
       "location": "asia",
-      "date_from": "01 Oct 2025",
-      "date_to": "22 Dec 2025"
+      "date_from": "19 Oct 2025",
+      "date_to": "14 Nov 2025"
     },
     "filters": {
       "excluded_countries": [],
       "max_pets": {
-        "dog": 2,
-        "cat": 2
       }
     },
     "notification": {
       "header": "🌏 ASIA SITS 🌏",
       "icon": "🌏"
+    }
+  },
+  "uk_with_car": {
+    "search": {
+      "location": "United Kingdom",
+      "date_from": "26 Dec 2025",
+      "date_to": "31 Jan 2026"
+    },
+    "filters": {
+      "excluded_countries": [],
+      "max_pets": {
+        "dog": 0,
+        "cat": 5
+      },
+      "car_included": true
+    },
+    "notification": {
+      "header": "🇬🇧 UK CAT SITS WITH CAR 🚗",
+      "icon": "🇬🇧"
     }
   }
 }
