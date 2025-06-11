@@ -5,7 +5,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '*/10 0-16 * * *'  # Every 10 minutes from 08:00 to 00:00 Perth time (UTC+8)
+    - cron: '*/10 0 * * *'  # Every 10 minutes from 08:00 to 00:00 Perth time (UTC+8)
   workflow_dispatch:
 
 permissions:
