@@ -10,10 +10,14 @@ import time
 import requests
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- Setup logging ---
-LOG_PATH = "scraper.log"
+# Ensure directories exist
+os.makedirs("data", exist_ok=True)
+os.makedirs("debug", exist_ok=True)
+
+LOG_PATH = "debug/scraper.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -31,20 +35,29 @@ if os.environ.get("GITHUB_ACTIONS") != "true":
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 HEADLESS = True  # Set to False for debugging
+MAX_CONCURRENT_BROWSERS = 1  # Number of browsers to run in parallel
 
 # --- Configuration ---
 BASE_URL = "https://www.trustedhousesitters.com/house-and-pet-sitting-assignments/"
 PET_TYPES = ["dog", "cat", "horse", "bird", "fish", "rabbit", "reptile", "poultry", "livestock", "small_pets"]
 CONTENT_COLS = ["title", "location", "town", "country", "date_from", "date_to", "reviewing"] + PET_TYPES
 MODES = ['public_transport', 'car_included', None]
-CSV_PATH = "sits.csv"
-JSON_PATH = "sits.json"
+CSV_PATH = "data/sits.csv"
+JSON_PATH = "data/sits.json"
 PROFILES_PATH = "filter_profiles.json"
 
 
 # --- Utility functions ---
 async def wait_like_human(min_sec=0.2, max_sec=0.5):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
+
+
+async def safe_screenshot(page, path, timeout=30000, **kwargs):
+    """Take a screenshot with error handling to prevent crashes"""
+    try:
+        await page.screenshot(path=path, timeout=timeout, **kwargs)
+    except Exception as e:
+        logging.warning(f"Failed to take screenshot {path}: {e}")
 
 
 def normalize_pet(pet: str) -> str:
@@ -59,7 +72,10 @@ def split_location(location: str) -> tuple[str, str]:
 
 def escape_markdown(text: str) -> str:
     if not isinstance(text, str): return text
-    return re.sub(r'([_\*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
+    # Only escape characters that have special meaning in Telegram Markdown:
+    # _ (italic), * (bold), [ ] (links), ` (code), ~ (strikethrough)
+    # Don't escape regular punctuation like: ! + . , ? : ; → - etc.
+    return re.sub(r'([_\*\[\]`~])', r'\\\1', text)
 
 
 async def extract_pets(card) -> dict:
@@ -171,120 +187,380 @@ def send_telegram_message(chunks: list[str]) -> None:
 # --- Browser interactions ---
 async def initial_search(page, profile_config) -> None:
     logging.info(f"Initial search setup for {profile_config['search']['location']}")
-    await page.goto(BASE_URL, wait_until='networkidle')
+    await page.goto(BASE_URL, wait_until='domcontentloaded', timeout=120000)
     await wait_like_human()
 
     # Take a screenshot to help with debugging
-    await page.screenshot(path=f"debug_initial_{profile_config['search']['location']}.png")
+    await safe_screenshot(page, f"debug/debug_initial_{profile_config['search']['location']}.png")
 
-    # Fill location
-    box = page.locator("input[placeholder*='Where would you like to go?']")
-    await box.wait_for(timeout=15000)
-    location = profile_config["search"]["location"]
-    await box.fill(location)
+    # Fill location using more reliable selector with timeout
+    try:
+        location_box = page.get_by_role("textbox", name="Search for a location")
+        await location_box.wait_for(timeout=20000)
+        location = profile_config["search"]["location"]
+        await location_box.click(timeout=20000)
+        await location_box.fill(location)
+        await wait_like_human()
+        
+        # Follow the exact recorded pattern: add space then click dropdown option  
+        await location_box.fill(location + " ")  # Add space to trigger dropdown
+        await wait_like_human()
+        
+        # Now click the location option that appears in dropdown, preferring continent options
+        try:
+            selected = False
+            
+            # First try to find an option that mentions "continent" (case insensitive)
+            continent_options = page.get_by_text(re.compile(rf'.*{location}.*continent.*', re.IGNORECASE))
+            if await continent_options.count() > 0:
+                try:
+                    # Try different click methods to handle interception
+                    option = continent_options.first
+                    await option.click(timeout=20000, force=True)
+                    selected = True
+                    logging.info(f"Selected continent option for {location}")
+                except Exception as click_error:
+                    logging.warning(f"Force click failed for continent option: {click_error}")
+                    try:
+                        # Try scrolling into view and clicking
+                        await option.scroll_into_view_if_needed()
+                        await wait_like_human(0.5, 1.0)
+                        await option.click(timeout=20000)
+                        selected = True
+                        logging.info(f"Selected continent option for {location} after scroll")
+                    except Exception as scroll_error:
+                        logging.warning(f"Scroll+click failed for continent option: {scroll_error}")
+
+            if not selected:
+                # Fallback to first exact match if no continent option found
+                exact_options = page.get_by_text(location, exact=True)
+                if await exact_options.count() > 0:
+                    try:
+                        option = exact_options.first
+                        await option.click(timeout=20000, force=True)
+                        selected = True
+                        logging.info(f"Selected first exact match for {location}")
+                    except Exception as click_error:
+                        logging.warning(f"Exact match click failed: {click_error}")
+
+            if not selected:
+                # Final fallback to partial match
+                partial_options = page.get_by_text(re.compile(rf'.*{location}.*', re.IGNORECASE))
+                if await partial_options.count() > 0:
+                    try:
+                        option = partial_options.first
+                        await option.click(timeout=20000, force=True)
+                        selected = True
+                        logging.info(f"Selected first partial match for {location}")
+                    except Exception as click_error:
+                        logging.warning(f"Partial match click failed: {click_error}")
+
+            if not selected:
+                raise Exception(f"No matching option found or clickable for {location}")
+                
+        except Exception as e:
+            logging.error(f"All location selection methods failed: {e}")
+            raise Exception(f"Location selection failed: {e}")
+        await wait_like_human()
+        
+        # Debug: Check if location was actually selected
+        await safe_screenshot(page, f"debug/debug_after_location_selection.png")
+        current_value = await location_box.input_value()
+        logging.info(f"Location box value after selection: '{current_value}'")
+        logging.info(f"Successfully selected location: {location}")
+    except Exception as e:
+        logging.error(f"Failed to select location after 10 seconds: {e}")
+        raise Exception(f"Location selection failed: {e}")
+
     await wait_like_human()
 
-    # For Europe, click the first exact match
-    if location.lower() == "europe":
-        await page.locator("text=Europe").first.click()
-    # For Asia, be more specific to handle multiple matches
-    elif location.lower() == "asia":
-        await page.locator("span").filter(has_text="Asia").first.click()
-    else:
-        # For other locations, use the capitalized name
-        await page.locator(f"text={location.capitalize()}").first.click()
+    # Set dates with timeout
+    try:
+        # Debug: Screenshot before clicking Dates
+        await safe_screenshot(page, f"debug/debug_before_dates.png")
+        
+        # Check if Dates button exists and is enabled
+        dates_button = page.get_by_role('button', name='Dates')
+        is_visible = await dates_button.is_visible()
+        is_enabled = await dates_button.is_enabled()
+        logging.info(f"Dates button - visible: {is_visible}, enabled: {is_enabled}")
+        
+        await dates_button.click(timeout=20000)
+        await wait_like_human()
+        logging.info("Successfully clicked Dates button")
+    except Exception as e:
+        logging.error(f"Failed to click Dates button after 10 seconds: {e}")
+        # Debug: Save state when Dates click fails
+        await safe_screenshot(page, f"debug/debug_dates_failed.png")
+        raise Exception(f"Dates button click failed: {e}")
+    
+    # Debug: Take screenshot and save HTML after opening date picker
+    await safe_screenshot(page, "debug/debug_date_picker_opened.png")
+    html_content = await page.content()
+    with open("debug/debug_date_picker.html", "w", encoding="utf-8") as f:
+        f.write(html_content)
 
-    await wait_like_human()
-
-    # Set dates
-    await page.get_by_role('button', name='Dates').click()
-    await wait_like_human()
-
-    # Extract month and year from the dates
-    date_from = profile_config["search"]["date_from"]  # e.g., "01 Nov 2025"
-    date_to = profile_config["search"]["date_to"]  # e.g., "24 Dec 2025"
-
+    # Extract dates from config - following recorded pattern
+    date_from = profile_config["search"]["date_from"]  # e.g., "27 Dec 2025"
+    date_to = profile_config["search"]["date_to"]  # e.g., "15 Feb 2026"
+    
     # Parse the dates
     from_parts = date_from.split(" ")
-    from_day = from_parts[0]
+    from_day = from_parts[0] 
     from_month = from_parts[1]
     from_year = from_parts[2]
-
+    
     to_parts = date_to.split(" ")
     to_day = to_parts[0]
-    to_month = to_parts[1]
+    to_month = to_parts[1] 
     to_year = to_parts[2]
-
-    # Navigate to the correct month - try for up to 10 clicks
-    found_month = False
-    for _ in range(10):
-        # Take a screenshot to see what we're looking at
-        await page.screenshot(path=f"calendar_navigation_{_}.png")
-
-        # Check for month in different formats - both full month name and abbreviated
-        # For example "November 2025" and "Nov 2025"
-        if await page.locator(f'text={from_month} {from_year}').is_visible() or \
-                await page.locator(f'text={from_month.capitalize()} {from_year}').is_visible() or \
-                await page.locator(f'text=November {from_year}').is_visible():
-            found_month = True
-            logging.info(f"Found target month after {_} clicks")
+    
+    # Navigate to start month using chevron-right clicks (following recorded pattern)
+    for i in range(15):  # Max 15 clicks to find the month
+        # Check if we can see the target month/year in the calendar header (try multiple formats)
+        month_found = False
+        
+        # Try full month name first since that's what the calendar shows
+        full_month_names = {"Jan": "January", "Feb": "February", "Mar": "March", "Apr": "April", 
+                          "May": "May", "Jun": "June", "Jul": "July", "Aug": "August",
+                          "Sep": "September", "Oct": "October", "Nov": "November", "Dec": "December"}
+        full_month = full_month_names.get(from_month, from_month)
+        
+        try:
+            if await page.locator(f'text={full_month} {from_year}').first.is_visible(timeout=1000):
+                logging.info(f"Found start month {full_month} {from_year} after {i} clicks")
+                month_found = True
+        except Exception as e:
+            logging.warning(f"Could not find full month {full_month} {from_year} on iteration {i}: {e}")
+        
+        if not month_found:
+            try:
+                # Fallback to abbreviated format
+                if await page.locator(f'text={from_month} {from_year}').first.is_visible(timeout=1000):
+                    logging.info(f"Found start month {from_month} {from_year} after {i} clicks")
+                    month_found = True
+            except Exception as e:
+                logging.warning(f"Could not find abbreviated month {from_month} {from_year} on iteration {i}: {e}")
+        
+        if month_found:
             break
-
-        await page.get_by_role('button', name='chevron-right').click()
-        await wait_like_human()
-
-    if not found_month:
-        logging.error(f"Could not find target month: {from_month} {from_year}")
-        raise Exception(f"Month navigation failed")
-
-    # Try different formats for date selection
-    try:
-        # First try original format
-        await page.get_by_label(f'{from_day} {from_month} {from_year}').click()
-    except Exception:
+        # Try different selectors for the right arrow button with timeout and enabled check
+        navigation_successful = False
         try:
-            # Try with leading zero
-            await page.get_by_label(f'{int(from_day):02d} {from_month} {from_year}').click()
-        except Exception:
+            next_button = page.locator('button:has-text(">")')
+            if await next_button.count() > 0 and await next_button.is_enabled():
+                await next_button.click(timeout=5000)
+                navigation_successful = True
+                logging.info(f"Clicked > button on iteration {i}")
+        except Exception as e:
+            logging.warning(f"Failed to click > button on iteration {i}: {e}")
+        
+        if not navigation_successful:
             try:
-                # Try with day of week
-                for day_name in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]:
-                    try:
-                        await page.get_by_label(f'{from_day} {from_month} {from_year} {day_name}').click()
-                        break
-                    except:
-                        continue
-            except Exception:
-                # Last resort - find and click the day number in the current month view
-                await page.locator(
-                    f'.react-datepicker__day:not(.react-datepicker__day--outside-month):text("{from_day}")').first.click()
-
+                # Look for right arrow or next button
+                next_buttons = page.locator('[aria-label*="next"], [aria-label*="Next"], button:has(svg)')
+                if await next_buttons.count() > 0:
+                    last_button = next_buttons.last
+                    if await last_button.is_enabled():
+                        await last_button.click(timeout=5000)
+                        navigation_successful = True
+                        logging.info(f"Clicked next/svg button on iteration {i}")
+            except Exception as e:
+                logging.warning(f"Failed to click next/svg button on iteration {i}: {e}")
+        
+        if not navigation_successful:
+            try:
+                # Last resort - generic navigation button
+                nav_buttons = page.locator('button').filter(has=page.locator('svg'))
+                if await nav_buttons.count() > 1:
+                    nav_button = nav_buttons.nth(1)
+                    if await nav_button.is_enabled():
+                        await nav_button.click(timeout=5000)
+                        navigation_successful = True
+                        logging.info(f"Clicked generic nav button on iteration {i}")
+            except Exception as e:
+                logging.warning(f"Failed to click generic nav button on iteration {i}: {e}")
+        
+        if not navigation_successful:
+            logging.error(f"Could not find any enabled navigation buttons on iteration {i}")
+            break  # Exit the loop if we can't navigate further
+        await wait_like_human()
+    else:
+        # This executes if the loop completes without breaking
+        logging.error(f"Could not find start month {from_month} {from_year} after 15 navigation attempts")
+        raise Exception(f"Could not navigate to start month {from_month} {from_year} - month may not be available on calendar")
+    
+    # Select start date using multiple fallback approaches
+    import calendar
+    from datetime import datetime
+    
+    date_selected = False
+    
+    # Try different date selection methods
+    try:
+        # Method 1: Try the exact format from recording "27 Dec 2025 Saturday"
+        date_obj = datetime.strptime(f"{from_day} {from_month} {from_year}", "%d %b %Y")
+        day_name = calendar.day_name[date_obj.weekday()]
+        await page.get_by_label(f"{from_day} {from_month} {from_year} {day_name}").click(timeout=5000)
+        logging.info(f"Selected start date: {from_day} {from_month} {from_year} {day_name}")
+        date_selected = True
+    except Exception as e:
+        logging.warning(f"Method 1 failed: {e}")
+    
+    if not date_selected:
+        try:
+            # Method 2: Simple format without day name
+            await page.get_by_label(f"{from_day} {from_month} {from_year}").click(timeout=5000)
+            logging.info(f"Selected start date: {from_day} {from_month} {from_year}")
+            date_selected = True
+        except Exception as e:
+            logging.warning(f"Method 2 failed: {e}")
+    
+    if not date_selected:
+        try:
+            # Method 3: Click on the day number directly in the calendar
+            await page.locator(f'button:has-text("{from_day}"):not([disabled])').first.click(timeout=5000)
+            logging.info(f"Selected start date by day number: {from_day}")
+            date_selected = True
+        except Exception as e:
+            logging.warning(f"Method 3 failed: {e}")
+    
+    if not date_selected:
+        try:
+            # Method 4: More generic calendar day selector
+            await page.locator(f'[role="button"]:has-text("{from_day}")').first.click(timeout=5000)
+            logging.info(f"Selected start date by role button: {from_day}")
+            date_selected = True
+        except Exception as e:
+            logging.warning(f"Method 4 failed: {e}")
+    
+    if not date_selected:
+        raise Exception(f"Could not select start date {from_day} {from_month} {from_year}")
+    
     await wait_like_human()
-
-    # Navigate to end date month if needed
+    
+    # Navigate to end month if different (following recorded pattern)
     if from_month != to_month or from_year != to_year:
-        await page.get_by_role('button', name='chevron-right').click()
-        await wait_like_human()
-
-    # Select end date with similar fallback options
-    try:
-        await page.get_by_label(f'{to_day} {to_month} {to_year}').click()
-    except Exception:
-        try:
-            await page.get_by_label(f'{int(to_day):02d} {to_month} {to_year}').click()
-        except Exception:
+        for i in range(15):  # Navigate to end month
+            # Check if we can see the target month/year in the calendar header (try multiple formats)
+            end_month_found = False
+            
+            # Try full month name first
+            full_to_month = full_month_names.get(to_month, to_month)
+            
             try:
-                # Try with day of week
-                for day_name in ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]:
-                    try:
-                        await page.get_by_label(f'{to_day} {to_month} {to_year} {day_name}').click()
-                        break
-                    except:
-                        continue
-            except Exception:
-                # Last resort - find and click the day number
-                await page.locator(
-                    f'.react-datepicker__day:not(.react-datepicker__day--outside-month):text("{to_day}")').first.click()
+                if await page.locator(f'text={full_to_month} {to_year}').first.is_visible(timeout=1000):
+                    logging.info(f"Found end month {full_to_month} {to_year} after {i} additional clicks")
+                    end_month_found = True
+            except Exception as e:
+                logging.warning(f"Could not find full end month {full_to_month} {to_year} on iteration {i}: {e}")
+            
+            if not end_month_found:
+                try:
+                    # Fallback to abbreviated format
+                    if await page.locator(f'text={to_month} {to_year}').first.is_visible(timeout=1000):
+                        logging.info(f"Found end month {to_month} {to_year} after {i} additional clicks")
+                        end_month_found = True
+                except Exception as e:
+                    logging.warning(f"Could not find abbreviated end month {to_month} {to_year} on iteration {i}: {e}")
+            
+            if end_month_found:
+                break
+                
+            # Try different selectors for the right arrow button with timeout and error handling
+            navigation_successful = False
+            try:
+                next_button = page.locator('button:has-text(">")')
+                if await next_button.count() > 0 and await next_button.is_enabled():
+                    await next_button.click(timeout=5000)
+                    navigation_successful = True
+                    logging.info(f"Clicked > button on end month iteration {i}")
+            except Exception as e:
+                logging.warning(f"Failed to click > button on end month iteration {i}: {e}")
+            
+            if not navigation_successful:
+                try:
+                    # Look for right arrow or next button
+                    next_buttons = page.locator('[aria-label*="next"], [aria-label*="Next"], button:has(svg)')
+                    if await next_buttons.count() > 0:
+                        last_button = next_buttons.last
+                        if await last_button.is_enabled():
+                            await last_button.click(timeout=5000)
+                            navigation_successful = True
+                            logging.info(f"Clicked next/svg button on end month iteration {i}")
+                except Exception as e:
+                    logging.warning(f"Failed to click next/svg button on end month iteration {i}: {e}")
+            
+            if not navigation_successful:
+                try:
+                    # Last resort - generic navigation button
+                    nav_buttons = page.locator('button').filter(has=page.locator('svg'))
+                    if await nav_buttons.count() > 1:
+                        nav_button = nav_buttons.nth(1)
+                        if await nav_button.is_enabled():
+                            await nav_button.click(timeout=5000)
+                            navigation_successful = True
+                            logging.info(f"Clicked generic nav button on end month iteration {i}")
+                except Exception as e:
+                    logging.warning(f"Failed to click generic nav button on end month iteration {i}: {e}")
+            
+            if not navigation_successful:
+                logging.error(f"Could not find any enabled navigation buttons on end month iteration {i}")
+                break  # Exit the loop if we can't navigate further
+                
+            await wait_like_human()
+        else:
+            # This executes if the loop completes without breaking
+            logging.error(f"Could not find end month {to_month} {to_year} after 15 navigation attempts")
+            raise Exception(f"Could not navigate to end month {to_month} {to_year} - month may not be available on calendar")
+    
+    # Select end date using multiple fallback approaches
+    end_date_selected = False
+    
+    try:
+        # Method 1: Try the exact format from recording
+        date_obj = datetime.strptime(f"{to_day} {to_month} {to_year}", "%d %b %Y")
+        day_name = calendar.day_name[date_obj.weekday()]
+        await page.get_by_label(f"{to_day} {to_month} {to_year} {day_name}").click(timeout=5000)
+        logging.info(f"Selected end date: {to_day} {to_month} {to_year} {day_name}")
+        end_date_selected = True
+    except Exception as e:
+        logging.warning(f"End date method 1 failed: {e}")
+    
+    if not end_date_selected:
+        try:
+            # Method 2: Simple format without day name
+            await page.get_by_label(f"{to_day} {to_month} {to_year}").click(timeout=5000)
+            logging.info(f"Selected end date: {to_day} {to_month} {to_year}")
+            end_date_selected = True
+        except Exception as e:
+            logging.warning(f"End date method 2 failed: {e}")
+    
+    if not end_date_selected:
+        try:
+            # Method 3: Click on the day number directly in the calendar
+            day_buttons = page.locator(f'button:has-text("{to_day}"):not([disabled])')
+            if await day_buttons.count() > 0:
+                await day_buttons.first.click(timeout=5000)
+                logging.info(f"Selected end date by day number: {to_day}")
+                end_date_selected = True
+        except Exception as e:
+            logging.warning(f"End date method 3 failed: {e}")
+    
+    if not end_date_selected:
+        try:
+            # Method 4: More generic calendar day selector
+            role_buttons = page.locator(f'[role="button"]:has-text("{to_day}")')
+            if await role_buttons.count() > 0:
+                await role_buttons.first.click(timeout=5000)
+                logging.info(f"Selected end date by role button: {to_day}")
+                end_date_selected = True
+        except Exception as e:
+            logging.warning(f"End date method 4 failed: {e}")
+    
+    if not end_date_selected:
+        logging.error(f"All end date selection methods failed for {to_day} {to_month} {to_year}")
+        raise Exception(f"Could not select end date {to_day} {to_month} {to_year} - date may not be available on calendar")
 
     await wait_like_human()
 
@@ -308,12 +584,12 @@ async def initial_search(page, profile_config) -> None:
         else:
             # This executes if the loop completes without breaking
             logging.error(f"Timed out waiting for page to load: {profile_config['search']['location']}")
-            await page.screenshot(path=f"error_page_load_{profile_config['search']['location']}.png")
+            await safe_screenshot(page, f"debug/error_page_load_{profile_config['search']['location']}.png")
             raise Exception("Page failed to load search results or no results message")
 
     except Exception as e:
         logging.error(f"Page failed to load search results: {e}")
-        await page.screenshot(path=f"error_page_load_{profile_config['search']['location']}.png")
+        await page.screenshot(path=f"debug/error_page_load_{profile_config['search']['location']}.png")
         raise
 
 
@@ -331,7 +607,7 @@ async def apply_filters(page, mode) -> None:
     try:
         # Click More Filters button
         more_filters = page.get_by_role("button", name="More Filters")
-        await more_filters.wait_for(state="visible", timeout=10000)
+        await more_filters.wait_for(state="visible", timeout=20000)
         await more_filters.click()
         await wait_like_human()
 
@@ -346,12 +622,12 @@ async def apply_filters(page, mode) -> None:
             await wait_like_human()
         else:
             logging.error(f"Filter option '{lbl_text}' not found")
-            await page.screenshot(path=f"error_filter_not_found_{mode}.png")
+            await safe_screenshot(page, f"debug/error_filter_not_found_{mode}.png")
             raise Exception(f"Filter option '{lbl_text}' not found")
 
         # Click Apply button
         apply_button = page.get_by_role("button", name="Apply")
-        await apply_button.wait_for(state="visible", timeout=5000)
+        await apply_button.wait_for(state="visible", timeout=15000)
         await apply_button.click()
         await wait_like_human()
 
@@ -368,12 +644,12 @@ async def apply_filters(page, mode) -> None:
         else:
             # This executes if the loop completes without breaking
             logging.error(f"Timed out waiting for page to load after applying filter: {mode}")
-            await page.screenshot(path=f"error_filter_applied_{mode}.png")
+            await safe_screenshot(page, f"debug/error_filter_applied_{mode}.png")
             raise Exception("Page failed to load search results or no results message after applying filter")
 
     except Exception as e:
         logging.error(f"Error applying filter '{mode}': {e}")
-        await page.screenshot(path=f"error_applying_filter_{mode}.png")
+        await safe_screenshot(page, f"debug/error_applying_filter_{mode}.png")
         raise
 
 
@@ -392,8 +668,8 @@ async def scrape_run(page, test_mode=False) -> list[dict]:
             logging.info(f"Scraping page {page_num}")
 
             # Wait for search results to load
-            await page.wait_for_selector('div[data-testid="searchresults_grid_item"]', timeout=15000)
-            await page.screenshot(path=f"debug_results_page_{page_num}.png")
+            await page.wait_for_selector('div[data-testid="searchresults_grid_item"]', timeout=30000)
+            await safe_screenshot(page, f"debug/debug_results_page_{page_num}.png")
 
             # Get all listing cards
             cards = await page.locator('div[data-testid="searchresults_grid_item"]').all()
@@ -471,7 +747,7 @@ async def scrape_run(page, test_mode=False) -> list[dict]:
 
     except Exception as e:
         logging.error(f"Error in scrape_run: {e}")
-        await page.screenshot(path=f"error_scrape_run.png")
+        await safe_screenshot(page, f"debug/error_scrape_run.png")
 
     return rows
 
@@ -490,6 +766,39 @@ def apply_profile_filters(df, profile_config):
     for pet_type, max_count in max_pets.items():
         if pet_type in PET_TYPES:
             filtered_df = filtered_df[filtered_df[pet_type] <= max_count]
+
+    # Apply minimum days filter
+    min_days = profile_config.get("filters", {}).get("min_days")
+    if min_days is not None and min_days > 0:
+        def calculate_days(row):
+            try:
+                if not row['date_from'] or not row['date_to']:
+                    return 0
+                # Parse dates in format like "Dec 11, 2025" or "11 Dec 2025"
+                from_str = row['date_from'].strip()
+                to_str = row['date_to'].strip()
+                
+                if not from_str or not to_str:
+                    return 0
+                    
+                # Try different date formats
+                for fmt in ["%b %d, %Y", "%d %b %Y", "%B %d, %Y", "%d %B %Y"]:
+                    try:
+                        from_date = datetime.strptime(from_str, fmt)
+                        to_date = datetime.strptime(to_str, fmt)
+                        return (to_date - from_date).days + 1  # Include both start and end days
+                    except ValueError:
+                        continue
+                return 0
+            except Exception:
+                return 0
+        
+        # Calculate duration and filter
+        filtered_df = filtered_df.copy()
+        filtered_df['duration_days'] = filtered_df.apply(calculate_days, axis=1)
+        filtered_df = filtered_df[filtered_df['duration_days'] >= min_days]
+        # Remove the temporary column
+        filtered_df = filtered_df.drop('duration_days', axis=1)
 
     return filtered_df
 
@@ -522,12 +831,18 @@ async def process_profile(profile_name, profile_config, test_mode=False):
             except Exception as e:
                 logging.critical(f"Mode {mode} failed for profile {profile_name}: {e}", exc_info=True)
                 html = await page.content()
-                with open(f"crash_dump_{profile_name}_{mode}.html", "w") as f:
+                with open(f"debug/crash_dump_{profile_name}_{mode}.html", "w") as f:
                     f.write(html)
-                await page.screenshot(path=f"crash_screenshot_{profile_name}_{mode}.png", full_page=True)
+                await safe_screenshot(page, f"debug/crash_screenshot_{profile_name}_{mode}.png", full_page=True)
                 return mode, []
 
-        results = await asyncio.gather(*(run_mode(mode) for mode in MODES))
+        # Run all filter modes sequentially to get transport information
+        results = []
+        for mode in MODES:
+            logging.info(f"Running mode: {mode} for profile {profile_name}")
+            result = await run_mode(mode)
+            results.append(result)
+        
         await browser.close()
 
     runs = dict(results)
@@ -537,7 +852,7 @@ async def process_profile(profile_name, profile_config, test_mode=False):
         logging.warning(f"No results found for profile {profile_name}")
         return pd.DataFrame()
 
-    now = datetime.utcnow().isoformat() + 'Z'
+    now = datetime.now(timezone.utc).isoformat() + 'Z'
     public_transport_ids = [listing_id_from_url(r['url']) for r in runs.get('public_transport', [])]
     car_included_ids = [listing_id_from_url(r['url']) for r in runs.get('car_included', [])]
 
@@ -562,15 +877,17 @@ async def main(test_mode=False) -> None:
 
     profiles = load_profiles()
     logging.info(f"Loaded {len(profiles)} search profiles")
-
-    async def run_profile(name, config):
+    
+    # Process profiles sequentially
+    results = []
+    for profile_name, profile_config in profiles.items():
         try:
-            return name, await process_profile(name, config, test_mode)
+            logging.info(f"Processing profile: {profile_name}")
+            result = await process_profile(profile_name, profile_config, test_mode)
+            results.append((profile_name, result))
         except Exception as e:
-            logging.error(f"Failed to process profile {name}: {e}", exc_info=True)
-            return name, e
-
-    results = await asyncio.gather(*(run_profile(name, config) for name, config in profiles.items()))
+            logging.error(f"Failed to process profile {profile_name}: {e}", exc_info=True)
+            results.append((profile_name, e))
 
     all_results = []
     for name, result in results:
@@ -596,7 +913,7 @@ async def main(test_mode=False) -> None:
 
     old_df['public_transport'] = old_df.get('public_transport', False).fillna(False).astype(bool)
     old_df['car_included'] = old_df.get('car_included', False).fillna(False).astype(bool)
-    default_fs = (datetime.utcnow() - timedelta(seconds=1)).isoformat() + 'Z'
+    default_fs = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat() + 'Z'
     old_df['first_seen'] = old_df.get('first_seen', default_fs)
     old_df['last_changed'] = old_df.get('last_changed', old_df['first_seen'])
 
@@ -607,7 +924,7 @@ async def main(test_mode=False) -> None:
 
     merged = old_df.set_index('unique_key').combine_first(base_df.set_index('unique_key'))
 
-    now = datetime.utcnow().isoformat() + 'Z'
+    now = datetime.now(timezone.utc).isoformat() + 'Z'
     for uk, row in merged.iterrows():
         if uk in base_df['unique_key'].values:
             nr = base_df.loc[base_df['unique_key'] == uk].iloc[0]
@@ -634,7 +951,13 @@ async def main(test_mode=False) -> None:
 
     out_df.to_csv(CSV_PATH, index=False, quoting=csv.QUOTE_NONNUMERIC)
     out_df.to_json(JSON_PATH, orient='records', indent=2)
-    logging.info(f"Saved {len(out_df)} records")
+    
+    # Count new listings this run
+    new_listings_count = len(out_df[out_df['new_this_run'] == True])
+    if new_listings_count > 0:
+        logging.info(f"Found {new_listings_count} new listings this run")
+    else:
+        logging.info("No new listings found this run")
 
     for profile_name, profile_config in profiles.items():
         profile_df = out_df[(out_df['new_this_run']) & (out_df['profile'] == profile_name)]
@@ -651,8 +974,9 @@ async def main(test_mode=False) -> None:
 if __name__ == '__main__':
     try:
         parser = argparse.ArgumentParser()
-        parser.add_argument('--test', action='store_true')
+        parser.add_argument('--test', action='store_true', help='Run in test mode (limited results)')
         args = parser.parse_args()
+        
         asyncio.run(main(test_mode=args.test))
     except Exception:
         logging.critical("Unhandled exception in main", exc_info=True)

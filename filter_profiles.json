@@ -1,9 +1,9 @@
 {
-  "europe": {
+  "southern_europe": {
     "search": {
-      "location": "europe",
-      "date_from": "11 Dec 2025",
-      "date_to": "24 Dec 2025"
+      "location": "Europe",
+      "date_from": "27 Dec 2025",
+      "date_to": "15 Feb 2026"
     },
     "filters": {
       "excluded_countries": ["United Kingdom", "Ireland"],
@@ -11,15 +11,15 @@
       }
     },
     "notification": {
-      "header": "🏰 EUROPE SITS AFTER GERMANY 🏰",
+      "header": "🏰 SOUTHERN EUROPE SITS 🏰",
       "icon": "🇪🇺"
     }
   },
   "asia": {
     "search": {
-      "location": "asia",
-      "date_from": "19 Oct 2025",
-      "date_to": "14 Nov 2025"
+      "location": "Asia",
+      "date_from": "18 Oct 2025",
+      "date_to": "15 Nov 2025"
     },
     "filters": {
       "excluded_countries": [],
@@ -31,23 +31,30 @@
       "icon": "🌏"
     }
   },
-  "uk_with_car": {
+  "europe_cats_december": {
     "search": {
-      "location": "United Kingdom",
-      "date_from": "26 Dec 2025",
-      "date_to": "31 Jan 2026"
+      "location": "Europe",
+      "date_from": "11 Dec 2025",
+      "date_to": "24 Dec 2025"
     },
     "filters": {
-      "excluded_countries": [],
+      "excluded_countries": ["United Kingdom", "Ireland"],
       "max_pets": {
         "dog": 0,
-        "cat": 5
+        "horse": 0,
+        "bird": 0,
+        "fish": 0,
+        "rabbit": 0,
+        "reptile": 0,
+        "poultry": 0,
+        "livestock": 0,
+        "small_pets": 0
       },
-      "car_included": true
+      "min_days": 4
     },
     "notification": {
-      "header": "🇬🇧 UK CAT SITS WITH CAR 🚗",
-      "icon": "🇬🇧"
+      "header": "🐱 DECEMBER CATS EUROPE 🐱",
+      "icon": "🐾"
     }
   }
 }
